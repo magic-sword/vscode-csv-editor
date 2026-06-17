@@ -7,25 +7,40 @@
     "vscode": "^1.90.0"
   },
   "categories": ["Other"],
+  "extensionKind": ["ui", "workspace"],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
-    "customEditors": [
+    "commands": [
       {
-        "viewType": "csvEditor.editor",
-        "displayName": "CSV Editor",
-        "selector": [
-          { "filenamePattern": "*.csv" }
-        ],
-        "priority": "default"
+        "command": "csvEditor.openTable",
+        "title": "CSVテーブルで開く",
+        "icon": "$(table)"
       }
-    ]
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "csvEditor.openTable",
+          "when": "resourceExtname == .csv",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "csvEditor.openTable",
+          "when": "resourceExtname == .csv",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

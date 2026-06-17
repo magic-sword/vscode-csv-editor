@@ -4,3 +4,7 @@ src/**
 .gitignore
 tsconfig.json
 node_modules/**
+archive/**
+.claude/**
+*.sh
+*.vsix

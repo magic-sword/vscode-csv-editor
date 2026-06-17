@@ -10,9 +10,7 @@ export function getWebviewContent(): string {
   body { font-family: var(--vscode-font-family); font-size: 13px; color: var(--vscode-foreground); background: var(--vscode-editor-background); height: 100vh; display: flex; flex-direction: column; }
 
   #toolbar { padding: 6px 10px; background: var(--vscode-editorGroupHeader-tabsBackground); border-bottom: 1px solid var(--vscode-panel-border); display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
-  #toolbar button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 4px 10px; cursor: pointer; border-radius: 2px; font-size: 12px; }
-  #toolbar button:hover { background: var(--vscode-button-hoverBackground); }
-  #status { margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground); }
+  #status { font-size: 11px; color: var(--vscode-descriptionForeground); }
 
   #table-container { flex: 1; overflow: auto; }
   table { border-collapse: collapse; width: max-content; min-width: 100%; }
@@ -22,6 +20,10 @@ export function getWebviewContent(): string {
   tr.selected td { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
   .json-badge { background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 3px; padding: 1px 5px; font-size: 10px; cursor: pointer; }
   .cell-preview { max-width: 280px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: middle; }
+
+  #load-more-row td { text-align: center; padding: 10px; }
+  #btn-load-more { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: 2px; padding: 5px 16px; cursor: pointer; font-size: 12px; }
+  #btn-load-more:disabled { opacity: 0.5; cursor: default; }
 
   #modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; justify-content: center; align-items: center; }
   #modal-overlay.open { display: flex; }
@@ -44,11 +46,20 @@ export function getWebviewContent(): string {
 <div id="loading">Loading CSV...</div>
 
 <div id="toolbar" style="display:none">
-  <button id="btn-save">Save</button>
   <span id="status"></span>
 </div>
 <div id="table-container" style="display:none">
-  <table id="csv-table"><thead></thead><tbody></tbody></table>
+  <table id="csv-table">
+    <thead></thead>
+    <tbody></tbody>
+    <tfoot>
+      <tr id="load-more-row" style="display:none">
+        <td id="load-more-cell">
+          <button id="btn-load-more">さらに読み込む</button>
+        </td>
+      </tr>
+    </tfoot>
+  </table>
 </div>
 
 <div id="modal-overlay">
@@ -68,46 +79,15 @@ export function getWebviewContent(): string {
 
 <script>
 const vscode = acquireVsCodeApi();
-let rows = [];      // string[][]
-let headers = [];   // string[]
+
+// rows[r][c] = { v: string, lazy: boolean, json: boolean }
+let rows = [];
+let headers = [];
+let totalRows = 0;
+let loadedCount = 0;
+let hasMore = false;
 let editingCell = { row: -1, col: -1 };
-
-// ── CSV parser (handles quoted fields with newlines) ──────────────────────────
-function parseCsv(text) {
-    const results = [];
-    let row = [], field = '', inQuote = false, i = 0;
-    while (i < text.length) {
-        const ch = text[i];
-        if (inQuote) {
-            if (ch === '"') {
-                if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
-                inQuote = false;
-            } else {
-                field += ch;
-            }
-        } else {
-            if (ch === '"') { inQuote = true; }
-            else if (ch === ',') { row.push(field); field = ''; }
-            else if (ch === '\\r' && text[i + 1] === '\\n') { row.push(field); results.push(row); row = []; field = ''; i++; }
-            else if (ch === '\\n') { row.push(field); results.push(row); row = []; field = ''; }
-            else { field += ch; }
-        }
-        i++;
-    }
-    if (field || row.length) { row.push(field); results.push(row); }
-    return results.filter(r => r.some(c => c.trim()));
-}
-
-function stringifyCsv(data) {
-    return data.map(row =>
-        row.map(cell => {
-            if (cell.includes(',') || cell.includes('"') || cell.includes('\\n') || cell.includes('\\r')) {
-                return '"' + cell.replace(/"/g, '""') + '"';
-            }
-            return cell;
-        }).join(',')
-    ).join('\\n');
-}
+const cellCache = new Map(); // "row,col" -> full content string
 
 function looksLikeJson(s) {
     const t = s.trim();
@@ -115,58 +95,99 @@ function looksLikeJson(s) {
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
-function renderTable() {
+function buildHeaderRow() {
     const thead = document.querySelector('#csv-table thead');
-    const tbody = document.querySelector('#csv-table tbody');
     thead.innerHTML = '';
-    tbody.innerHTML = '';
-
     const hrow = document.createElement('tr');
     hrow.appendChild(Object.assign(document.createElement('th'), { textContent: '#' }));
     headers.forEach(h => {
         hrow.appendChild(Object.assign(document.createElement('th'), { textContent: h }));
     });
     thead.appendChild(hrow);
+}
 
-    rows.forEach((row, ri) => {
-        const tr = document.createElement('tr');
-        tr.appendChild(Object.assign(document.createElement('td'), { textContent: ri + 1 }));
-        row.forEach((cell, ci) => {
-            const td = document.createElement('td');
-            if (looksLikeJson(cell)) {
-                const badge = document.createElement('span');
-                badge.className = 'json-badge';
-                badge.textContent = 'JSON';
-                badge.onclick = (e) => { e.stopPropagation(); openModal(ri, ci); };
-                td.appendChild(badge);
-            } else {
-                const span = document.createElement('span');
-                span.className = 'cell-preview';
-                span.textContent = cell;
-                td.appendChild(span);
-                td.ondblclick = () => openModal(ri, ci);
-            }
-            tr.appendChild(td);
-        });
-        tbody.appendChild(tr);
+function makeDataRow(rowData, rowIndex) {
+    const tr = document.createElement('tr');
+    tr.appendChild(Object.assign(document.createElement('td'), { textContent: rowIndex + 1 }));
+    rowData.forEach((cell, ci) => {
+        const td = document.createElement('td');
+        if (cell.json) {
+            const badge = document.createElement('span');
+            badge.className = 'json-badge';
+            badge.textContent = 'JSON';
+            badge.onclick = (e) => { e.stopPropagation(); openModal(rowIndex, ci); };
+            td.appendChild(badge);
+        } else {
+            const span = document.createElement('span');
+            span.className = 'cell-preview';
+            span.textContent = cell.v;
+            td.appendChild(span);
+            td.ondblclick = () => openModal(rowIndex, ci);
+        }
+        tr.appendChild(td);
     });
+    return tr;
+}
 
-    document.getElementById('status').textContent = rows.length + ' rows, ' + headers.length + ' columns';
+function appendRowsToTable(newRows, startIndex) {
+    const tbody = document.querySelector('#csv-table tbody');
+    const frag = document.createDocumentFragment();
+    newRows.forEach((rowData, i) => {
+        frag.appendChild(makeDataRow(rowData, startIndex + i));
+    });
+    tbody.appendChild(frag);
+}
+
+function updateStatus() {
+    const shown = hasMore ? loadedCount + ' / ' + totalRows : totalRows.toString();
+    document.getElementById('status').textContent = shown + ' rows, ' + headers.length + ' columns';
+}
+
+function updateLoadMoreButton() {
+    const row = document.getElementById('load-more-row');
+    const btn = document.getElementById('btn-load-more');
+    if (hasMore) {
+        row.style.display = '';
+        // colspan = headers + row-number column
+        document.getElementById('load-more-cell').colSpan = headers.length + 1;
+        btn.disabled = false;
+        btn.textContent = 'さらに読み込む (' + loadedCount + ' / ' + totalRows + ')';
+    } else {
+        row.style.display = 'none';
+    }
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 function openModal(ri, ci) {
     editingCell = { row: ri, col: ci };
-    const raw = rows[ri][ci];
+    const cell = rows[ri][ci];
+    const key = ri + ',' + ci;
+
+    document.getElementById('modal-title').textContent = headers[ci] + '  (row ' + (ri + 1) + ')';
+    document.getElementById('modal-error').style.display = 'none';
+    document.getElementById('modal-overlay').classList.add('open');
+
+    if (cell.lazy && !cellCache.has(key)) {
+        const ta = document.getElementById('modal-textarea');
+        ta.value = 'Loading...';
+        ta.disabled = true;
+        document.getElementById('btn-save-cell').disabled = true;
+        vscode.postMessage({ type: 'getCellContent', row: ri, col: ci });
+    } else {
+        showModalContent(cell.lazy ? cellCache.get(key) : cell.v);
+    }
+}
+
+function showModalContent(raw) {
     let display = raw;
     if (looksLikeJson(raw)) {
         try { display = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
     }
-    document.getElementById('modal-title').textContent = headers[ci] + '  (row ' + (ri + 1) + ')';
-    document.getElementById('modal-textarea').value = display;
-    document.getElementById('modal-error').style.display = 'none';
-    document.getElementById('modal-overlay').classList.add('open');
-    document.getElementById('modal-textarea').focus();
+    const ta = document.getElementById('modal-textarea');
+    ta.value = display;
+    ta.disabled = false;
+    document.getElementById('btn-save-cell').disabled = false;
+    ta.focus();
 }
 
 function closeModal() {
@@ -175,14 +196,24 @@ function closeModal() {
 
 document.getElementById('modal-close').onclick = closeModal;
 document.getElementById('btn-cancel').onclick = closeModal;
-document.getElementById('modal-overlay').onclick = (e) => { if (e.target === document.getElementById('modal-overlay')) closeModal(); };
+document.getElementById('modal-overlay').onclick = (e) => {
+    if (e.target === document.getElementById('modal-overlay')) closeModal();
+};
+
+document.getElementById('btn-load-more').onclick = () => {
+    document.getElementById('btn-load-more').disabled = true;
+    vscode.postMessage({ type: 'requestPage', start: loadedCount });
+};
 
 document.getElementById('btn-save-cell').onclick = () => {
     const { row, col } = editingCell;
     let value = document.getElementById('modal-textarea').value;
     const errEl = document.getElementById('modal-error');
+    const cell = rows[row][col];
+    const key = row + ',' + col;
+    const originalRaw = cell.lazy ? (cellCache.get(key) ?? '') : cell.v;
 
-    if (looksLikeJson(rows[row][col])) {
+    if (looksLikeJson(originalRaw)) {
         try {
             value = JSON.stringify(JSON.parse(value));
         } catch (e) {
@@ -192,28 +223,82 @@ document.getElementById('btn-save-cell').onclick = () => {
         }
     }
 
-    rows[row][col] = value;
-    renderTable();
+    const isJson = looksLikeJson(value);
+    const nowLazy = cell.lazy;
+    if (nowLazy) {
+        cellCache.set(key, value);
+        rows[row][col] = { v: value.slice(0, 80), lazy: true, json: isJson };
+    } else {
+        rows[row][col] = { v: value, lazy: false, json: isJson };
+    }
+
+    // Update the specific cell in the DOM instead of re-rendering everything
+    const tbody = document.querySelector('#csv-table tbody');
+    const tr = tbody.rows[row];
+    if (tr) {
+        const td = tr.cells[col + 1]; // +1 for row-number column
+        td.innerHTML = '';
+        if (isJson) {
+            const badge = document.createElement('span');
+            badge.className = 'json-badge';
+            badge.textContent = 'JSON';
+            badge.onclick = (e) => { e.stopPropagation(); openModal(row, col); };
+            td.appendChild(badge);
+        } else {
+            const span = document.createElement('span');
+            span.className = 'cell-preview';
+            span.textContent = value;
+            td.appendChild(span);
+            td.ondblclick = () => openModal(row, col);
+        }
+    }
+
     closeModal();
+    vscode.postMessage({ type: 'editCell', row, col, value });
 };
 
-// ── Save ──────────────────────────────────────────────────────────────────────
-document.getElementById('btn-save').onclick = () => {
-    const allData = [headers, ...rows];
-    vscode.postMessage({ type: 'save', text: stringifyCsv(allData) });
-};
-
-// ── Message from extension ────────────────────────────────────────────────────
+// ── Messages from extension ───────────────────────────────────────────────────
 window.addEventListener('message', ({ data }) => {
-    if (data.type !== 'load') return;
-    const parsed = parseCsv(data.text);
-    if (parsed.length === 0) return;
-    headers = parsed[0];
-    rows = parsed.slice(1);
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('toolbar').style.display = 'flex';
-    document.getElementById('table-container').style.display = 'block';
-    renderTable();
+    switch (data.type) {
+        case 'load': {
+            headers = data.headers;
+            rows = data.rows;
+            totalRows = data.totalRows;
+            hasMore = data.hasMore;
+            loadedCount = data.rows.length;
+            cellCache.clear();
+
+            buildHeaderRow();
+            document.querySelector('#csv-table tbody').innerHTML = '';
+            appendRowsToTable(rows, 0);
+
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('toolbar').style.display = 'flex';
+            document.getElementById('table-container').style.display = 'block';
+            updateStatus();
+            updateLoadMoreButton();
+            break;
+        }
+        case 'appendRows': {
+            const newRows = data.rows;
+            const start = data.start;
+            hasMore = data.hasMore;
+            rows = rows.concat(newRows);
+            loadedCount = rows.length;
+            appendRowsToTable(newRows, start);
+            updateStatus();
+            updateLoadMoreButton();
+            break;
+        }
+        case 'cellContent': {
+            const key = data.row + ',' + data.col;
+            cellCache.set(key, data.text);
+            if (editingCell.row === data.row && editingCell.col === data.col) {
+                showModalContent(data.text);
+            }
+            break;
+        }
+    }
 });
 </script>
 </body>

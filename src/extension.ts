@@ -1,8 +1,12 @@
 import * as vscode from 'vscode';
-import { CsvEditorProvider } from './csvEditorProvider';
+import { openCsvEditor } from './csvEditorProvider';
 
 export function activate(context: vscode.ExtensionContext) {
-    context.subscriptions.push(CsvEditorProvider.register(context));
+    context.subscriptions.push(
+        vscode.commands.registerCommand('csvEditor.openTable', (uri?: vscode.Uri) => {
+            openCsvEditor(context, uri);
+        })
+    );
 }
 
 export function deactivate() {}
