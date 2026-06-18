@@ -8,6 +8,7 @@ const STREAM_BATCH = 50;    // max rows per streaming message
 const FLUSH_INTERVAL_MS = 50; // flush at most every 50ms (or when batch is full)
 const YIELD_EVERY = 50_000;
 const TREE_PAGE = 50;
+const STORED_CELL_MAX = 5000; // cells longer than this are stored truncated; full content read on demand
 
 // ── Query parser ───────────────────────────────────────────────────────────────
 
@@ -400,6 +401,27 @@ async function* parseCsvRowsFromFile(
     }
 }
 
+// Reads specific rows from a CSV file without holding everything in memory.
+// Used for on-demand retrieval of cells that were stored truncated to avoid OOM.
+async function readRowsFromFile(filePath: string, rowIndices: number[]): Promise<Map<number, string[]>> {
+    const target = new Set(rowIndices);
+    const result = new Map<number, string[]>();
+    if (target.size === 0) return result;
+    const maxRow = Math.max(...rowIndices);
+    let isHeader = true;
+    let dataRowIdx = 0;
+    for await (const row of parseCsvRowsFromFile(filePath)) {
+        if (isHeader) { isHeader = false; continue; }
+        if (target.has(dataRowIdx)) {
+            result.set(dataRowIdx, row);
+            if (result.size === target.size) break;
+        }
+        if (dataRowIdx >= maxRow) break;
+        dataRowIdx++;
+    }
+    return result;
+}
+
 function stringifyCsv(data: string[][]): string {
     return data.map(row =>
         row.map(cell => {
@@ -425,6 +447,11 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
     let headers: string[] = [];
     let jsonCacheKey = '';
     let jsonCacheParsed: unknown = null;
+    // Tracks cells stored truncated (key = "rowIdx,colIdx"). Full content must be read from file.
+    let truncatedCells = new Set<string>();
+    // true when Node's fs module can access targetUri.fsPath directly (local or WSL remote).
+    // 'vscode-remote' = extension runs on remote (WSL) side, fsPath is a native Linux path.
+    const canUseNativeFs = targetUri.scheme === 'file' || targetUri.scheme === 'vscode-remote';
 
     // Search state
     let searchResultIndices: number[] | null = null;
@@ -433,6 +460,7 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
     const loadFile = async () => {
         rows = [];
         headers = [];
+        truncatedCells.clear();
 
         // Throttled progress callback — sends at most one message per 100ms
         let lastProgressTime = 0;
@@ -443,9 +471,9 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
             panel.webview.postMessage({ type: 'progress', bytesRead, totalBytes });
         };
 
-        // Local files: stream 1 MB chunks directly — no full-file toString blocking.
-        // Remote URIs: fall back to reading the whole file first.
-        const iter = targetUri.scheme === 'file'
+        // Local and WSL-remote files: stream 1 MB chunks via Node's fs (fsPath is a native path).
+        // Other remote URIs (e.g. vscode-vfs): fall back to reading the whole file via VS Code API.
+        const iter = canUseNativeFs
             ? parseCsvRowsFromFile(targetUri.fsPath, sendProgress)
             : (async function* () {
                 const bytes = await vscode.workspace.fs.readFile(targetUri);
@@ -479,7 +507,17 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
                 return;
             }
             const startIndex = rows.length;
-            for (const r of batch) rows.push(r);
+            for (let bi = 0; bi < batch.length; bi++) {
+                const rowIdx = startIndex + bi;
+                const storedRow = batch[bi].map((cell, ci) => {
+                    if (cell.length > STORED_CELL_MAX) {
+                        truncatedCells.add(`${rowIdx},${ci}`);
+                        return cell.slice(0, STORED_CELL_MAX);
+                    }
+                    return cell;
+                });
+                rows.push(storedRow);
+            }
 
             // Only send up to PAGE_SIZE rows to DOM; the rest stay in extension memory
             if (sentToWebview < PAGE_SIZE) {
@@ -513,7 +551,22 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
     };
 
     const saveFile = async () => {
-        const text = stringifyCsv([headers, ...rows]);
+        if (truncatedCells.size === 0) {
+            // Fast path: all cells stored completely
+            const text = stringifyCsv([headers, ...rows]);
+            await vscode.workspace.fs.writeFile(targetUri, Buffer.from(text, 'utf8'));
+            return;
+        }
+        // Some cells are stored truncated — re-read those rows from file to get original full content
+        const truncatedRowSet = new Set<number>();
+        for (const key of truncatedCells) truncatedRowSet.add(parseInt(key.split(',')[0]));
+        const fileRows = await readRowsFromFile(targetUri.fsPath, Array.from(truncatedRowSet));
+        const fullRows = rows.map((row, r) => {
+            if (!truncatedRowSet.has(r)) return row;
+            const fileRow = fileRows.get(r) ?? row;
+            return row.map((cell, c) => truncatedCells.has(`${r},${c}`) ? (fileRow[c] ?? cell) : cell);
+        });
+        const text = stringifyCsv([headers, ...fullRows]);
         await vscode.workspace.fs.writeFile(targetUri, Buffer.from(text, 'utf8'));
     };
 
@@ -526,9 +579,17 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
                 break;
 
             // ── Text cell ──────────────────────────────────────────────────
-            case 'getCellContent':
-                panel.webview.postMessage({ type: 'cellContent', row: msg.row, col: msg.col, text: rows[msg.row]?.[msg.col] ?? '' });
+            case 'getCellContent': {
+                const key = `${msg.row},${msg.col}`;
+                if (truncatedCells.has(key) && canUseNativeFs) {
+                    const fileRows = await readRowsFromFile(targetUri.fsPath, [msg.row]);
+                    const text = fileRows.get(msg.row)?.[msg.col] ?? rows[msg.row]?.[msg.col] ?? '';
+                    panel.webview.postMessage({ type: 'cellContent', row: msg.row, col: msg.col, text });
+                } else {
+                    panel.webview.postMessage({ type: 'cellContent', row: msg.row, col: msg.col, text: rows[msg.row]?.[msg.col] ?? '' });
+                }
                 break;
+            }
 
             case 'editCell':
                 if (rows[msg.row]) { rows[msg.row][msg.col] = msg.value; await saveFile(); }
@@ -601,13 +662,21 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
             // ── JSON tree ──────────────────────────────────────────────────
             case 'getCellJson': {
                 const cacheKey = `${msg.row},${msg.col}`;
-                const raw = rows[msg.row]?.[msg.col] ?? '';
-                let parsed: unknown;
-                if (jsonCacheKey === cacheKey) { parsed = jsonCacheParsed; }
-                else {
-                    try { parsed = JSON.parse(raw); jsonCacheKey = cacheKey; jsonCacheParsed = parsed; }
-                    catch { panel.webview.postMessage({ type: 'cellContent', row: msg.row, col: msg.col, text: raw }); break; }
+                if (jsonCacheKey === cacheKey) {
+                    panel.webview.postMessage({ type: 'cellJsonNode', row: msg.row, col: msg.col, path: [], offset: 0, node: summarizeNode(jsonCacheParsed, 0) });
+                    break;
                 }
+                let raw: string;
+                if (truncatedCells.has(cacheKey) && canUseNativeFs) {
+                    // Cell was stored truncated — re-read full content from file
+                    const fileRows = await readRowsFromFile(targetUri.fsPath, [msg.row]);
+                    raw = fileRows.get(msg.row)?.[msg.col] ?? rows[msg.row]?.[msg.col] ?? '';
+                } else {
+                    raw = rows[msg.row]?.[msg.col] ?? '';
+                }
+                let parsed: unknown;
+                try { parsed = JSON.parse(raw); jsonCacheKey = cacheKey; jsonCacheParsed = parsed; }
+                catch { panel.webview.postMessage({ type: 'cellContent', row: msg.row, col: msg.col, text: raw }); break; }
                 panel.webview.postMessage({ type: 'cellJsonNode', row: msg.row, col: msg.col, path: [], offset: 0, node: summarizeNode(parsed, 0) });
                 break;
             }
@@ -634,6 +703,7 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
                 else setAtPath(jsonCacheParsed, msg.path, msg.value);
                 const newRaw = JSON.stringify(jsonCacheParsed);
                 rows[msg.row][msg.col] = newRaw;
+                truncatedCells.delete(`${msg.row},${msg.col}`); // now stored in full
                 await saveFile();
                 panel.webview.postMessage({ type: 'cellPreviewUpdated', row: msg.row, col: msg.col, preview: newRaw.slice(0, 80) });
                 break;

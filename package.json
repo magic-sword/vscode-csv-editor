@@ -2,12 +2,12 @@
   "name": "vscode-csv-editor",
   "displayName": "CSV Editor",
   "description": "Large CSV viewer and editor with JSON cell support",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": ["Other"],
-  "extensionKind": ["ui", "workspace"],
+  "extensionKind": ["workspace"],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
