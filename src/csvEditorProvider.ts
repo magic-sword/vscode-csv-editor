@@ -216,11 +216,11 @@ function setAtPath(root: unknown, path: (string | number)[], newVal: unknown): v
 // ── CSV helpers ────────────────────────────────────────────────────────────────
 
 function looksLikeJson(s: string): boolean {
-    let lo = 0, hi = s.length - 1;
-    while (lo <= hi && s.charCodeAt(lo) <= 32) lo++;
-    while (hi >= lo && s.charCodeAt(hi) <= 32) hi--;
-    if (lo > hi) return false;
-    return (s[lo] === '{' && s[hi] === '}') || (s[lo] === '[' && s[hi] === ']');
+    let lo = 0;
+    while (lo < s.length && s.charCodeAt(lo) <= 32) lo++;
+    if (lo >= s.length) return false;
+    // Check only the first non-whitespace char: truncated cells may not have a closing bracket.
+    return s[lo] === '{' || s[lo] === '[';
 }
 
 function hasContent(s: string): boolean {
@@ -295,9 +295,14 @@ async function* parseCsvRows(text: string): AsyncGenerator<string[]> {
 // Streaming CSV parser: reads the file in 1 MB chunks via createReadStream.
 // Uses indexOf() instead of char-by-char scanning — 10–100× faster for large JSON cells.
 // Yields to the macrotask queue (setImmediate) after each chunk so VS Code IPC stays live.
+//
+// maxCellChars: maximum characters stored per cell. Content beyond this limit is scanned
+// (so parsing remains correct) but not accumulated in memory. Pass Infinity to store everything.
+// This keeps peak memory at O(maxCellChars) even for cells that are hundreds of MB.
 async function* parseCsvRowsFromFile(
     filePath: string,
     onChunk?: (bytesRead: number, totalBytes: number) => void,
+    maxCellChars = Infinity,
 ): AsyncGenerator<string[]> {
     const totalBytes = (() => { try { return fs.statSync(filePath).size; } catch { return 0; } })();
     let bytesRead = 0;
@@ -308,11 +313,29 @@ async function* parseCsvRowsFromFile(
     let inQuote = false;
     let pendingCR = false;
     let pendingQuote = false;
+    // Track how many chars have been accumulated for the current quoted field.
+    // Once fieldSize >= maxCellChars we continue scanning (to find the closing quote)
+    // but stop pushing into fieldParts — keeping peak memory bounded.
+    let fieldSize = 0;
+
+    // Add s to the current field, respecting the maxCellChars limit.
+    const addToField = (s: string) => {
+        if (fieldSize >= maxCellChars) return;
+        const rem = maxCellChars - fieldSize;
+        if (s.length <= rem) {
+            fieldParts.push(s);
+            fieldSize += s.length;
+        } else {
+            fieldParts.push(s.slice(0, rem));
+            fieldSize = maxCellChars;
+        }
+    };
 
     const endField = () => {
         const v = fieldParts.length === 0 ? '' : fieldParts.length === 1 ? fieldParts[0] : fieldParts.join('');
         currentRow.push(v);
         fieldParts = [];
+        fieldSize = 0;
     };
 
     const endRow = (): string[] | null => {
@@ -334,8 +357,8 @@ async function* parseCsvRowsFromFile(
         }
         if (pendingQuote) {
             pendingQuote = false;
-            if (i < chunk.length && chunk[i] === '"') { fieldParts.push('"'); i++; }
-            else                                      { inQuote = false; }
+            if (i < chunk.length && chunk[i] === '"') { addToField('"'); i++; } // "" escape at boundary
+            else                                      { inQuote = false; fieldSize = 0; } // closing quote at boundary
         }
 
         while (i < chunk.length) {
@@ -344,13 +367,13 @@ async function* parseCsvRowsFromFile(
                 const qi = chunk.indexOf('"', i);
                 if (qi === -1) {
                     // No '"' in remainder of chunk — whole slice is field content
-                    fieldParts.push(chunk.slice(i));
+                    addToField(chunk.slice(i));
                     i = chunk.length;
                 } else {
-                    if (qi > i) fieldParts.push(chunk.slice(i, qi));
+                    if (qi > i) addToField(chunk.slice(i, qi));
                     if (qi + 1 < chunk.length) {
-                        if (chunk[qi + 1] === '"') { fieldParts.push('"'); i = qi + 2; } // "" escape
-                        else                       { inQuote = false;      i = qi + 1; } // closing quote
+                        if (chunk[qi + 1] === '"') { addToField('"'); i = qi + 2; } // "" escape
+                        else                       { inQuote = false; fieldSize = 0; i = qi + 1; } // closing quote
                     } else {
                         pendingQuote = true; i = chunk.length; // '"' at chunk boundary
                     }
@@ -364,7 +387,7 @@ async function* parseCsvRowsFromFile(
                 ci = chunk.indexOf('\r', i); if (ci !== -1 && ci < ns) ns = ci;
                 ci = chunk.indexOf('"',  i); if (ci !== -1 && ci < ns) ns = ci;
 
-                if (ns > i) fieldParts.push(chunk.slice(i, ns));
+                if (ns > i) fieldParts.push(chunk.slice(i, ns)); // unquoted fields are always small
                 i = ns;
                 if (i >= chunk.length) break;
 
@@ -395,7 +418,7 @@ async function* parseCsvRowsFromFile(
         await new Promise<void>(resolve => setImmediate(resolve));
     }
 
-    if (pendingQuote) inQuote = false;
+    if (pendingQuote) { inQuote = false; fieldSize = 0; }
     if (fieldParts.length > 0 || currentRow.length > 0) {
         const r = endRow(); if (r) yield r;
     }
@@ -472,9 +495,10 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
         };
 
         // Local and WSL-remote files: stream 1 MB chunks via Node's fs (fsPath is a native path).
+        // maxCellChars caps per-cell memory: the parser scans but does not store beyond the limit.
         // Other remote URIs (e.g. vscode-vfs): fall back to reading the whole file via VS Code API.
         const iter = canUseNativeFs
-            ? parseCsvRowsFromFile(targetUri.fsPath, sendProgress)
+            ? parseCsvRowsFromFile(targetUri.fsPath, sendProgress, STORED_CELL_MAX)
             : (async function* () {
                 const bytes = await vscode.workspace.fs.readFile(targetUri);
                 const text = Buffer.from(bytes).toString('utf8');
@@ -509,14 +533,11 @@ export async function openCsvEditor(context: vscode.ExtensionContext, uri?: vsco
             const startIndex = rows.length;
             for (let bi = 0; bi < batch.length; bi++) {
                 const rowIdx = startIndex + bi;
-                const storedRow = batch[bi].map((cell, ci) => {
-                    if (cell.length > STORED_CELL_MAX) {
-                        truncatedCells.add(`${rowIdx},${ci}`);
-                        return cell.slice(0, STORED_CELL_MAX);
-                    }
-                    return cell;
+                // Parser already truncated cells to STORED_CELL_MAX; just record which were truncated.
+                batch[bi].forEach((cell, ci) => {
+                    if (cell.length >= STORED_CELL_MAX) truncatedCells.add(`${rowIdx},${ci}`);
                 });
-                rows.push(storedRow);
+                rows.push(batch[bi]);
             }
 
             // Only send up to PAGE_SIZE rows to DOM; the rest stay in extension memory
