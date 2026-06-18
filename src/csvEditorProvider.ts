@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
-import { getWebviewContent } from './webview';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as crypto from 'crypto';
 import { STORED_CELL_MAX, makeWebviewCells, makeWebviewRows, parseCsvRows, parseCsvRowsFromFile, readRowsFromFile, stringifyCsv } from './csvParser';
 import { parseQuery, evalExpr } from './queryFilter';
 import { summarizeNode, getAtPath, setAtPath, valueType } from './jsonTree';
@@ -7,6 +9,19 @@ import { summarizeNode, getAtPath, setAtPath, valueType } from './jsonTree';
 const PAGE_SIZE        = 500;
 const STREAM_BATCH     = 50;
 const FLUSH_INTERVAL_MS = 50;
+
+// Returns a path that Node.js fs can open directly.
+// For WSL remote URIs, converts to the Windows UNC path \\wsl.localhost\<distro>\...
+// so the extension (running on the UI/local side) can stream large files without loading
+// the entire file via vscode.workspace.fs.
+function getNativePath(uri: vscode.Uri): string | null {
+    if (uri.scheme === 'file') return uri.fsPath;
+    if (uri.scheme === 'vscode-remote' && uri.authority.startsWith('wsl+')) {
+        const distro = uri.authority.slice(4);
+        return `\\\\wsl.localhost\\${distro}${uri.path.replace(/\//g, '\\')}`;
+    }
+    return null;
+}
 
 class CsvEditorPanel {
     private readonly panel: vscode.WebviewPanel;
@@ -17,25 +32,69 @@ class CsvEditorPanel {
     private jsonCacheParsed: unknown = null;
     private searchResultIndices: number[] | null = null;
     private searchSeq = 0;
-    // true when Node's fs module can access targetUri.fsPath directly (local or WSL remote).
     private readonly canUseNativeFs: boolean;
+    private readonly nativePath: string;
 
     constructor(
         context: vscode.ExtensionContext,
         private readonly targetUri: vscode.Uri,
     ) {
-        this.canUseNativeFs = targetUri.scheme === 'file' || targetUri.scheme === 'vscode-remote';
+        const nativePath = getNativePath(targetUri);
+        this.canUseNativeFs = nativePath !== null;
+        this.nativePath = nativePath ?? '';
         const fileName = targetUri.path.split('/').pop() ?? 'CSV Editor';
+        const webviewDir = vscode.Uri.joinPath(context.extensionUri, 'out', 'webview');
         this.panel = vscode.window.createWebviewPanel(
             'csvEditor', fileName, vscode.ViewColumn.Active,
-            { enableScripts: true, localResourceRoots: [], retainContextWhenHidden: true },
+            { enableScripts: true, localResourceRoots: [webviewDir], retainContextWhenHidden: true },
         );
-        this.panel.webview.html = getWebviewContent();
+        this.panel.webview.html = this.buildWebviewHtml(context.extensionUri.fsPath, webviewDir);
         this.panel.webview.onDidReceiveMessage(
             (msg) => this.handleMessage(msg as Record<string, unknown>),
             undefined,
             context.subscriptions,
         );
+    }
+
+    private buildWebviewHtml(extensionPath: string, webviewDir: vscode.Uri): string {
+        const distDir = path.join(extensionPath, 'out', 'webview');
+        let styleContent: string;
+        try {
+            styleContent = fs.readFileSync(path.join(distDir, 'main.css'), 'utf8');
+        } catch (e) {
+            return `<!DOCTYPE html><html><body><pre style="padding:20px;color:#f48771;font-family:monospace">
+Failed to load CSS:\n${String(e)}\n\nextensionPath: ${extensionPath}</pre></body></html>`;
+        }
+        const w = this.panel.webview;
+        const scriptUri = w.asWebviewUri(vscode.Uri.joinPath(webviewDir, 'main.js'));
+        const nonce = crypto.randomBytes(16).toString('hex');
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src data:;">
+<style>${styleContent}</style>
+</head>
+<body>
+<div id="root"><div style="padding:20px;color:#ccc;font-family:monospace">Loading…</div></div>
+<script nonce="${nonce}">
+window.onerror = function(msg, _src, _line, _col, err) {
+  document.getElementById('root').innerHTML =
+    '<pre style="padding:20px;color:#f48771;font-family:monospace;white-space:pre-wrap;font-size:12px"><b>JS Error:</b>\n' +
+    msg + '\n\n' + (err ? err.stack : '(no stack)') + '</pre>';
+  return true;
+};
+window.addEventListener('unhandledrejection', function(e) {
+  document.getElementById('root').innerHTML =
+    '<pre style="padding:20px;color:#f48771;font-family:monospace;white-space:pre-wrap;font-size:12px"><b>Unhandled Rejection:</b>\n' +
+    String(e.reason) + '</pre>';
+});
+</script>
+<script nonce="${nonce}" src="${scriptUri}"></script>
+</body>
+</html>`;
     }
 
     private post(msg: object): void {
@@ -46,7 +105,7 @@ class CsvEditorPanel {
     private async getFullCell(row: number, col: number): Promise<string> {
         const key = `${row},${col}`;
         if (this.truncatedCells.has(key) && this.canUseNativeFs) {
-            const fileRows = await readRowsFromFile(this.targetUri.fsPath, [row]);
+            const fileRows = await readRowsFromFile(this.nativePath, [row]);
             return fileRows.get(row)?.[col] ?? this.rows[row]?.[col] ?? '';
         }
         return this.rows[row]?.[col] ?? '';
@@ -69,7 +128,7 @@ class CsvEditorPanel {
         // Other remote URIs (e.g. vscode-vfs): fall back to reading the whole file via VS Code API.
         const targetUri = this.targetUri;
         const iter = this.canUseNativeFs
-            ? parseCsvRowsFromFile(targetUri.fsPath, sendProgress, STORED_CELL_MAX)
+            ? parseCsvRowsFromFile(this.nativePath, sendProgress, STORED_CELL_MAX)
             : (async function* () {
                 const bytes = await vscode.workspace.fs.readFile(targetUri);
                 const text = Buffer.from(bytes).toString('utf8');
@@ -128,7 +187,7 @@ class CsvEditorPanel {
         // Some cells are stored truncated — re-read those rows from file to get original full content.
         const truncatedRowSet = new Set<number>();
         for (const key of this.truncatedCells) truncatedRowSet.add(parseInt(key.split(',')[0]));
-        const fileRows = await readRowsFromFile(this.targetUri.fsPath, Array.from(truncatedRowSet));
+        const fileRows = await readRowsFromFile(this.nativePath, Array.from(truncatedRowSet));
         const fullRows = this.rows.map((row, r) => {
             if (!truncatedRowSet.has(r)) return row;
             const fileRow = fileRows.get(r) ?? row;

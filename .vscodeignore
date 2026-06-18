@@ -4,6 +4,7 @@ src/**
 .gitignore
 tsconfig.json
 node_modules/**
+webview-ui/**
 archive/**
 .claude/**
 *.sh

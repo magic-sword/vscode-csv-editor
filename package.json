@@ -2,12 +2,13 @@
   "name": "vscode-csv-editor",
   "displayName": "CSV Editor",
   "description": "Large CSV viewer and editor with JSON cell support",
-  "version": "0.0.3",
+  "version": "0.0.5",
+  "publisher": "magic-sword",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": ["Other"],
-  "extensionKind": ["workspace"],
+  "extensionKind": ["ui"],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -36,8 +37,10 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run build",
+    "build": "npm run compile && npm run build:webview",
     "compile": "tsc -p ./",
+    "build:webview": "cd webview-ui && npm install --prefer-offline && npm run build",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src",
     "package": "vsce package"

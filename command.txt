@@ -1,0 +1,3 @@
+npm run build — TypeScript (extension) + Vite (webview) を両方ビルド
+cd webview-ui && npm run dev — webview の開発サーバー起動（ホットリロード付き）
+npm run package # VSIXのビルド
