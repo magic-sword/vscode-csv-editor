@@ -151,615 +151,598 @@ export function getWebviewContent(): string {
 <script>
 const vscode = acquireVsCodeApi();
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let rows = [];               // currently displayed WebviewCell[][]
-let rowOriginalIndices = []; // rowOriginalIndices[i] = original CSV row index for rows[i]
-let headers = [];
-let totalRows = 0;
-let loadedCount = 0;
-let hasMore = false;
-let isLoading = false;       // true while extension is still parsing remaining rows
-let loadBytesRead = 0;
-let loadTotalBytes = 0;
-
-// Search state
-let isSearchMode = false;
-let searchTotalMatches = 0;
-let searchLoadedCount = 0;
-let searchHasMore = false;
-
-// Text modal
-let editingCell = { row: -1, col: -1 }; // row = original CSV row index
-const cellCache = new Map(); // "origRow,col" -> full text
-
-// JSON tree modal
-let jsonRow = -1, jsonCol = -1;
-let jsonPath = [];
-let pendingScalarEdit = null;
-
-// ── Utilities ─────────────────────────────────────────────────────────────────
 function looksLikeJson(s) {
     const t = s.trim();
     return (t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'));
 }
 
-function getOriginalIndex(displayedRi) {
-    return rowOriginalIndices[displayedRi] ?? displayedRi;
-}
+// ── TableView ──────────────────────────────────────────────────────────────────
+// Responsible for all CSV table DOM operations.
+class TableView {
+    constructor(onOpenModal) {
+        this.onOpenModal = onOpenModal; // (displayedRi, ci) => void
+    }
 
-// ── Table rendering ───────────────────────────────────────────────────────────
-function buildHeaderRow() {
-    const thead = document.querySelector('#csv-table thead');
-    thead.innerHTML = '';
-    const hrow = document.createElement('tr');
-    hrow.appendChild(Object.assign(document.createElement('th'), { textContent: '#' }));
-    headers.forEach(h => hrow.appendChild(Object.assign(document.createElement('th'), { textContent: h })));
-    thead.appendChild(hrow);
-}
+    buildHeader(headers) {
+        const thead = document.querySelector('#csv-table thead');
+        thead.innerHTML = '';
+        const hrow = document.createElement('tr');
+        hrow.appendChild(Object.assign(document.createElement('th'), { textContent: '#' }));
+        headers.forEach(h => hrow.appendChild(Object.assign(document.createElement('th'), { textContent: h })));
+        thead.appendChild(hrow);
+    }
 
-// displayedRi: index in rows array (for onclick capture)
-// origIdx: original CSV row index (for display number + data-orig-row)
-function makeDataRow(rowData, displayedRi, origIdx) {
-    const tr = document.createElement('tr');
-    tr.dataset.origRow = String(origIdx);
+    clearBody() {
+        document.querySelector('#csv-table tbody').innerHTML = '';
+    }
 
-    const numTd = document.createElement('td');
-    numTd.className = 'row-num';
-    numTd.textContent = String(origIdx + 1);
-    tr.appendChild(numTd);
+    appendRows(rows, startDisplay, origIndices) {
+        const frag = document.createDocumentFragment();
+        rows.forEach((rowData, i) => {
+            const displayedRi = startDisplay + i;
+            const origIdx = origIndices ? origIndices[i] : displayedRi;
+            frag.appendChild(this._makeDataRow(rowData, displayedRi, origIdx));
+        });
+        document.querySelector('#csv-table tbody').appendChild(frag);
+    }
 
-    rowData.forEach((cell, ci) => {
-        const td = document.createElement('td');
-        if (cell.json) {
+    updateCell(origRow, ci, value, isJson, displayedRi) {
+        const tr = document.querySelector('#csv-table tbody [data-orig-row="' + origRow + '"]');
+        if (!tr) return;
+        const td = tr.cells[ci + 1];
+        if (!td) return;
+        td.innerHTML = '';
+        if (isJson) {
             const badge = document.createElement('span');
             badge.className = 'json-badge';
             badge.textContent = 'JSON';
-            badge.onclick = e => { e.stopPropagation(); openModal(displayedRi, ci); };
+            badge.onclick = e => { e.stopPropagation(); this.onOpenModal(displayedRi, ci); };
             td.appendChild(badge);
         } else {
-            const span = document.createElement('span');
-            span.className = 'cell-preview';
-            span.textContent = cell.v;
+            const span = Object.assign(document.createElement('span'), { className: 'cell-preview', textContent: value });
             td.appendChild(span);
-            td.ondblclick = () => openModal(displayedRi, ci);
-        }
-        tr.appendChild(td);
-    });
-    return tr;
-}
-
-function appendRowsToTable(newRows, startDisplay, origIndices) {
-    const tbody = document.querySelector('#csv-table tbody');
-    const frag = document.createDocumentFragment();
-    newRows.forEach((rowData, i) => {
-        const displayedRi = startDisplay + i;
-        const origIdx = origIndices ? origIndices[i] : displayedRi;
-        frag.appendChild(makeDataRow(rowData, displayedRi, origIdx));
-    });
-    tbody.appendChild(frag);
-}
-
-function updateStatus() {
-    const statusEl = document.getElementById('status');
-    if (isSearchMode) {
-        const shown = searchHasMore ? searchLoadedCount + ' / ' + searchTotalMatches : String(searchTotalMatches);
-        statusEl.innerHTML = shown + ' 件ヒット (全 ' + totalRows + ' 行, ' + headers.length + ' 列)';
-    } else if (isLoading) {
-        statusEl.innerHTML = loadedCount + ' 行表示中 <span id="loading-indicator">読み込み中...</span>';
-    } else {
-        const shown = hasMore ? loadedCount + ' / ' + totalRows : String(totalRows);
-        statusEl.textContent = shown + ' 行, ' + headers.length + ' 列';
-    }
-}
-
-function updateLoadingProgress() {
-    const stats = document.getElementById('loading-stats');
-    if (!stats) return;
-    const fill = document.getElementById('loading-progress-fill');
-    if (loadTotalBytes > 0) {
-        const pct = Math.min(100, Math.round(loadBytesRead / loadTotalBytes * 100));
-        fill.style.setProperty('--pct', pct + '%');
-        fill.classList.add('determinate');
-        const mb = (loadBytesRead / 1024 / 1024).toFixed(0);
-        const totalMb = (loadTotalBytes / 1024 / 1024).toFixed(0);
-        stats.textContent = mb + ' MB / ' + totalMb + ' MB  (' + pct + '%)  —  ' + loadedCount + ' 行';
-    } else {
-        stats.textContent = loadedCount > 0 ? loadedCount + ' 行読み込み済み...' : '';
-    }
-}
-
-function setSearchEnabled(enabled) {
-    const input = document.getElementById('search-input');
-    const btn = document.getElementById('btn-search');
-    input.disabled = !enabled;
-    btn.disabled = !enabled;
-    if (!enabled) {
-        input.placeholder = '読み込み完了後に検索できます';
-    } else {
-        input.placeholder = '例: label = "cat"  /  score >= 0.9 AND name contains "Alice"  /  (a = "x" OR b = "y") AND c != "z"';
-    }
-}
-
-function updateLoadMoreButton() {
-    const row = document.getElementById('load-more-row');
-    const btn = document.getElementById('btn-load-more');
-    // hide pagination while the file is still being parsed
-    const active = !isLoading && (isSearchMode ? searchHasMore : hasMore);
-    const loaded = isSearchMode ? searchLoadedCount : loadedCount;
-    const total  = isSearchMode ? searchTotalMatches : totalRows;
-    if (active) {
-        row.style.display = '';
-        document.getElementById('load-more-cell').colSpan = headers.length + 1;
-        btn.disabled = false;
-        btn.textContent = 'さらに読み込む (' + loaded + ' / ' + total + ')';
-    } else {
-        row.style.display = 'none';
-    }
-}
-
-function updateTableCell(origRow, ci, fullValue, isJson) {
-    const tbody = document.querySelector('#csv-table tbody');
-    const tr = tbody.querySelector('[data-orig-row="' + origRow + '"]');
-    if (!tr) return;
-    const td = tr.cells[ci + 1];
-    if (!td) return;
-    td.innerHTML = '';
-    const displayedRi = rows.findIndex((_, i) => getOriginalIndex(i) === origRow);
-    if (isJson) {
-        const badge = document.createElement('span');
-        badge.className = 'json-badge';
-        badge.textContent = 'JSON';
-        badge.onclick = e => { e.stopPropagation(); openModal(displayedRi, ci); };
-        td.appendChild(badge);
-    } else {
-        const span = document.createElement('span');
-        span.className = 'cell-preview';
-        span.textContent = fullValue;
-        td.appendChild(span);
-        td.ondblclick = () => openModal(displayedRi, ci);
-    }
-}
-
-// ── Modal routing ─────────────────────────────────────────────────────────────
-function openModal(displayedRi, ci) {
-    const origRow = getOriginalIndex(displayedRi);
-    editingCell = { row: origRow, col: ci };
-    const cell = rows[displayedRi][ci];
-
-    document.getElementById('modal-error').style.display = 'none';
-    document.getElementById('modal-title').textContent = headers[ci] + '  (行 ' + (origRow + 1) + ')';
-    document.getElementById('modal-overlay').classList.add('open');
-
-    if (cell.lazy && cell.json) {
-        enterJsonMode(origRow, ci);
-    } else {
-        enterTextMode(origRow, ci, cell);
-    }
-}
-
-function closeModal() {
-    document.getElementById('modal-overlay').classList.remove('open');
-    pendingScalarEdit = null;
-}
-
-document.getElementById('modal-close').onclick = closeModal;
-document.getElementById('modal-overlay').onclick = e => {
-    if (e.target === document.getElementById('modal-overlay')) closeModal();
-};
-
-// ── Text mode ─────────────────────────────────────────────────────────────────
-function enterTextMode(origRow, ci, cell) {
-    document.getElementById('modal-textarea').style.display = 'block';
-    document.getElementById('modal-footer').style.display = 'flex';
-    document.getElementById('json-breadcrumb').style.display = 'none';
-    document.getElementById('json-tree-view').style.display = 'none';
-
-    const key = origRow + ',' + ci;
-    if (cell.lazy && !cellCache.has(key)) {
-        const ta = document.getElementById('modal-textarea');
-        ta.value = 'Loading...';
-        ta.disabled = true;
-        document.getElementById('btn-save-cell').disabled = true;
-        vscode.postMessage({ type: 'getCellContent', row: origRow, col: ci });
-    } else {
-        showTextContent(cell.lazy ? cellCache.get(key) : cell.v);
-    }
-}
-
-function showTextContent(raw) {
-    let display = raw;
-    if (looksLikeJson(raw)) {
-        try { display = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
-    }
-    const ta = document.getElementById('modal-textarea');
-    ta.value = display;
-    ta.disabled = false;
-    document.getElementById('btn-save-cell').disabled = false;
-    ta.focus();
-}
-
-document.getElementById('btn-cancel').onclick = closeModal;
-
-document.getElementById('btn-save-cell').onclick = () => {
-    const { row, col } = editingCell;
-    let value = document.getElementById('modal-textarea').value;
-    const errEl = document.getElementById('modal-error');
-    const key = row + ',' + col;
-    const displayedRi = rows.findIndex((_, i) => getOriginalIndex(i) === row);
-    const cell = rows[displayedRi]?.[col];
-    if (!cell) return;
-    const originalRaw = cell.lazy ? (cellCache.get(key) ?? '') : cell.v;
-
-    if (looksLikeJson(originalRaw)) {
-        try { value = JSON.stringify(JSON.parse(value)); }
-        catch (e) {
-            errEl.textContent = 'Invalid JSON: ' + e.message;
-            errEl.style.display = 'block';
-            return;
+            td.ondblclick = () => this.onOpenModal(displayedRi, ci);
         }
     }
 
-    const isJson = looksLikeJson(value);
-    if (cell.lazy) {
-        cellCache.set(key, value);
-        rows[displayedRi][col] = { v: value.slice(0, 80), lazy: true, json: isJson };
-    } else {
-        rows[displayedRi][col] = { v: value, lazy: false, json: isJson };
-    }
-
-    updateTableCell(row, col, value, isJson);
-    closeModal();
-    vscode.postMessage({ type: 'editCell', row, col, value });
-};
-
-// ── Search ────────────────────────────────────────────────────────────────────
-function doSearch() {
-    const q = document.getElementById('search-input').value.trim();
-    document.getElementById('search-error').textContent = '';
-    vscode.postMessage({ type: 'search', query: q });
-}
-
-document.getElementById('btn-search').onclick = doSearch;
-document.getElementById('search-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter') doSearch();
-    if (e.key === 'Escape') doClearSearch();
-});
-
-function doClearSearch() {
-    isSearchMode = false;
-    document.getElementById('search-input').value = '';
-    document.getElementById('btn-clear-search').style.display = 'none';
-    document.getElementById('search-error').textContent = '';
-    vscode.postMessage({ type: 'clearSearch' });
-}
-
-document.getElementById('btn-clear-search').onclick = doClearSearch;
-
-// ── Load more ─────────────────────────────────────────────────────────────────
-document.getElementById('btn-load-more').onclick = () => {
-    document.getElementById('btn-load-more').disabled = true;
-    if (isSearchMode) {
-        vscode.postMessage({ type: 'requestSearchPage', start: searchLoadedCount });
-    } else {
-        vscode.postMessage({ type: 'requestPage', start: loadedCount });
-    }
-};
-
-// ── JSON tree mode ────────────────────────────────────────────────────────────
-function enterJsonMode(origRow, ci) {
-    jsonRow = origRow; jsonCol = ci;
-    jsonPath = [];
-    pendingScalarEdit = null;
-
-    document.getElementById('modal-textarea').style.display = 'none';
-    document.getElementById('modal-footer').style.display = 'none';
-    document.getElementById('json-breadcrumb').style.display = 'flex';
-    document.getElementById('json-tree-view').style.display = 'block';
-
-    renderBreadcrumb();
-    setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
-    vscode.postMessage({ type: 'getCellJson', row: origRow, col: ci });
-}
-
-function setTreeHTML(html) { document.getElementById('json-tree-view').innerHTML = html; }
-
-function renderBreadcrumb() {
-    const el = document.getElementById('json-breadcrumb');
-    el.innerHTML = '';
-    const addCrumb = (label, path) => {
-        const span = document.createElement('span');
-        span.className = 'bc-item';
-        span.textContent = label;
-        span.onclick = () => navigateTo(path);
-        el.appendChild(span);
-    };
-    addCrumb('root', []);
-    jsonPath.forEach((seg, idx) => {
-        const sep = document.createElement('span');
-        sep.className = 'bc-sep';
-        sep.textContent = ' › ';
-        el.appendChild(sep);
-        addCrumb(String(seg), jsonPath.slice(0, idx + 1));
-    });
-}
-
-function navigateTo(path) {
-    jsonPath = path;
-    renderBreadcrumb();
-    setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
-    vscode.postMessage({ type: 'expandJsonPath', row: jsonRow, col: jsonCol, path });
-}
-
-function renderJsonNode(node, appendMode, offset) {
-    const container = document.getElementById('json-tree-view');
-    if (!appendMode) container.innerHTML = '';
-
-    if (node.kind === 'scalar') { renderScalarRoot(container, node); return; }
-
-    let ul = appendMode ? container.querySelector('.jtree') : null;
-    if (!ul) { ul = document.createElement('ul'); ul.className = 'jtree'; container.appendChild(ul); }
-
-    const existingMore = container.querySelector('.jmore-btn');
-    if (existingMore) existingMore.remove();
-
-    if (node.kind === 'object') {
-        node.entries.forEach(({ key, preview, vtype }) =>
-            ul.appendChild(createEntry('"' + key + '"', 'jkey', key, preview, vtype)));
-    } else if (node.kind === 'array') {
-        node.items.forEach(({ preview, vtype }, idx) =>
-            ul.appendChild(createEntry('[' + (offset + idx) + ']', 'jindex', offset + idx, preview, vtype)));
-    }
-
-    if (node.shown < node.total) {
-        const btn = document.createElement('button');
-        btn.className = 'jmore-btn';
-        const shown = node.shown;
-        btn.textContent = '↓ Load more (' + node.shown + ' / ' + node.total + ' shown)';
-        btn.onclick = () => {
-            btn.disabled = true; btn.textContent = 'Loading…';
-            vscode.postMessage({ type: 'expandJsonPath', row: jsonRow, col: jsonCol, path: jsonPath, offset: shown });
-        };
-        container.appendChild(btn);
-    }
-}
-
-function renderScalarRoot(container, node) {
-    const div = document.createElement('div');
-    div.style.cssText = 'padding:8px 6px;display:flex;align-items:baseline;gap:10px;';
-    const valEl = document.createElement('span');
-    valEl.className = 'jval-' + node.vtype;
-    valEl.textContent = node.display;
-    div.appendChild(valEl);
-    const editBtn = document.createElement('button');
-    editBtn.className = 'jedit-btn';
-    editBtn.style.opacity = '1';
-    editBtn.textContent = 'Edit';
-    editBtn.onclick = () => {
-        pendingScalarEdit = { el: valEl, li: div, path: [...jsonPath], vtype: node.vtype };
-        vscode.postMessage({ type: 'getJsonScalar', row: jsonRow, col: jsonCol, path: jsonPath });
-    };
-    div.appendChild(editBtn);
-    container.appendChild(div);
-}
-
-function createEntry(label, labelClass, keyOrIndex, preview, vtype) {
-    const li = document.createElement('li');
-    const keyEl = document.createElement('span');
-    keyEl.className = labelClass;
-    keyEl.textContent = label + ':';
-    li.appendChild(keyEl);
-
-    const isNavigable = vtype === 'object' || vtype === 'array';
-    const valEl = document.createElement('span');
-    valEl.className = isNavigable ? 'jnav' : ('jval-' + vtype);
-    valEl.textContent = preview;
-    li.appendChild(valEl);
-
-    if (isNavigable) {
-        valEl.onclick = () => {
-            jsonPath = [...jsonPath, keyOrIndex];
-            renderBreadcrumb();
-            setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
-            vscode.postMessage({ type: 'expandJsonPath', row: jsonRow, col: jsonCol, path: jsonPath });
-        };
-    } else {
-        const editBtn = document.createElement('button');
-        editBtn.className = 'jedit-btn';
-        editBtn.textContent = 'Edit';
-        editBtn.onclick = () => {
-            pendingScalarEdit = { el: valEl, li, path: [...jsonPath, keyOrIndex], vtype };
-            vscode.postMessage({ type: 'getJsonScalar', row: jsonRow, col: jsonCol, path: [...jsonPath, keyOrIndex] });
-        };
-        li.appendChild(editBtn);
-    }
-    return li;
-}
-
-function startInlineEdit(raw, vtype) {
-    if (!pendingScalarEdit) return;
-    const { el, li, path } = pendingScalarEdit;
-    pendingScalarEdit = null;
-    el.style.display = 'none';
-
-    const wrap = document.createElement('div');
-    wrap.className = 'jinput-wrap';
-    const isLong = raw.length > 60;
-    let input;
-    if (isLong) { input = document.createElement('textarea'); input.rows = Math.min(Math.ceil(raw.length / 60), 6); input.style.resize = 'vertical'; }
-    else { input = document.createElement('input'); input.type = 'text'; }
-    input.className = 'jinput';
-    input.value = raw;
-    wrap.appendChild(input);
-
-    const btnRow = document.createElement('div');
-    btnRow.className = 'jinput-btns';
-    const saveBtn = document.createElement('button'); saveBtn.className = 'jinput-save'; saveBtn.textContent = isLong ? 'Save (Ctrl+Enter)' : 'Save (Enter)';
-    const cancelBtn = document.createElement('button'); cancelBtn.className = 'jinput-cancel'; cancelBtn.textContent = 'Cancel';
-    btnRow.appendChild(saveBtn); btnRow.appendChild(cancelBtn);
-    wrap.appendChild(btnRow);
-    li.appendChild(wrap);
-    input.focus();
-
-    const cleanup = () => { wrap.remove(); el.style.display = ''; };
-
-    const save = () => {
-        const newRaw = input.value;
-        let newValue;
-        if (vtype === 'string') newValue = newRaw;
-        else { try { newValue = JSON.parse(newRaw); } catch { newValue = newRaw; } }
-        cleanup();
-        const newVtype = newValue === null ? 'null' : typeof newValue;
-        el.className = 'jval-' + newVtype;
-        el.textContent = typeof newValue === 'string' ? JSON.stringify(newValue) : String(newValue);
-        const note = document.createElement('span'); note.className = 'jsaved-note'; note.textContent = '✓ Saved';
-        li.appendChild(note); setTimeout(() => note.remove(), 1500);
-        vscode.postMessage({ type: 'saveJsonPath', row: jsonRow, col: jsonCol, path, value: newValue });
-    };
-
-    saveBtn.onclick = save;
-    cancelBtn.onclick = cleanup;
-    input.addEventListener('keydown', e => {
-        if (e.key === 'Escape') cleanup();
-        if (e.key === 'Enter' && (e.ctrlKey || input.tagName !== 'TEXTAREA')) save();
-    });
-}
-
-// ── Messages from extension ───────────────────────────────────────────────────
-window.addEventListener('message', ({ data }) => {
-    switch (data.type) {
-
-        case 'load': {
-            isSearchMode = false;
-            isLoading = !!data.isLoading;
-            loadBytesRead = 0;
-            loadTotalBytes = 0;
-            headers = data.headers;
-            rows = [];   // always empty; streamRows fills it
-            rowOriginalIndices = [];
-            totalRows = 0;
-            hasMore = false;
-            loadedCount = 0;
-            cellCache.clear();
-            buildHeaderRow();
-            document.querySelector('#csv-table tbody').innerHTML = '';
-            // Keep #loading visible during streaming; hide it only on loadComplete.
-            // Set it up as a progress screen (title + bar). Table renders behind it.
-            if (isLoading) {
-                document.getElementById('loading').style.display = 'flex';
-                document.getElementById('loading-title').textContent = 'CSV を読み込み中...';
+    _makeDataRow(rowData, displayedRi, origIdx) {
+        const tr = document.createElement('tr');
+        tr.dataset.origRow = String(origIdx);
+        tr.appendChild(Object.assign(document.createElement('td'), { className: 'row-num', textContent: String(origIdx + 1) }));
+        rowData.forEach((cell, ci) => {
+            const td = document.createElement('td');
+            if (cell.json) {
+                const badge = document.createElement('span');
+                badge.className = 'json-badge';
+                badge.textContent = 'JSON';
+                badge.onclick = e => { e.stopPropagation(); this.onOpenModal(displayedRi, ci); };
+                td.appendChild(badge);
             } else {
-                document.getElementById('loading').style.display = 'none';
+                td.appendChild(Object.assign(document.createElement('span'), { className: 'cell-preview', textContent: cell.v }));
+                td.ondblclick = () => this.onOpenModal(displayedRi, ci);
             }
-            document.getElementById('toolbar').style.display = 'flex';
-            document.getElementById('search-bar').style.display = 'flex';
-            document.getElementById('table-container').style.display = 'block';
-            document.getElementById('btn-clear-search').style.display = 'none';
-            setSearchEnabled(!isLoading);
-            updateStatus(); updateLoadMoreButton(); updateLoadingProgress();
-            break;
-        }
+            tr.appendChild(td);
+        });
+        return tr;
+    }
+}
 
-        case 'streamRows': {
-            const startDisplay = rows.length;
-            rows = rows.concat(data.rows);
-            rowOriginalIndices = rowOriginalIndices.concat(data.rows.map((_, i) => startDisplay + i));
-            loadedCount = rows.length;
-            appendRowsToTable(data.rows, startDisplay, null);
-            updateStatus();
-            updateLoadingProgress();
-            break;
-        }
+// ── CellModal ──────────────────────────────────────────────────────────────────
+// Responsible for the cell editing modal: text mode and JSON tree mode.
+class CellModal {
+    constructor(vscode, getRows, getOriginalIndex, onTableCellUpdated) {
+        this.vscode = vscode;
+        this.getRows = getRows;                     // () => rows[][]
+        this.getOriginalIndex = getOriginalIndex;   // (displayedRi) => origIdx
+        this.onTableCellUpdated = onTableCellUpdated; // (origRow, ci, value, isJson, displayedRi) => void
 
-        case 'loadComplete': {
-            isLoading = false;
-            totalRows = data.totalRows;
-            hasMore = data.hasMore;
-            document.getElementById('loading').style.display = 'none';
-            setSearchEnabled(true);
-            updateStatus(); updateLoadMoreButton();
-            break;
-        }
+        this.editingCell = { row: -1, col: -1 };
+        this.cellCache = new Map();  // "origRow,col" -> full text
+        this.jsonRow = -1;
+        this.jsonCol = -1;
+        this.jsonPath = [];
+        this.pendingScalarEdit = null;
 
-        case 'appendRows': {
-            const startDisplay = rows.length;
-            rows = rows.concat(data.rows);
-            rowOriginalIndices = rowOriginalIndices.concat(data.rows.map((_, i) => startDisplay + i));
-            hasMore = data.hasMore;
-            loadedCount = rows.length;
-            appendRowsToTable(data.rows, startDisplay, null);
-            updateStatus(); updateLoadMoreButton();
-            break;
-        }
+        this._bindEvents();
+    }
 
-        case 'searchResults': {
-            isSearchMode = true;
-            searchTotalMatches = data.totalMatches;
-            searchHasMore = data.hasMore;
-            document.getElementById('search-error').textContent = '';
-            document.getElementById('btn-clear-search').style.display = '';
+    clearCache() { this.cellCache.clear(); }
 
-            if (data.pageStart === 0) {
-                rows = [];
-                rowOriginalIndices = [];
-                searchLoadedCount = 0;
-                document.querySelector('#csv-table tbody').innerHTML = '';
-            }
+    open(displayedRi, ci, headers) {
+        const origRow = this.getOriginalIndex(displayedRi);
+        this.editingCell = { row: origRow, col: ci };
+        const cell = this.getRows()[displayedRi][ci];
 
-            const startDisplay = rows.length;
-            rows = rows.concat(data.rows);
-            rowOriginalIndices = rowOriginalIndices.concat(data.originalIndices);
-            searchLoadedCount = rows.length;
+        document.getElementById('modal-error').style.display = 'none';
+        document.getElementById('modal-title').textContent = headers[ci] + '  (行 ' + (origRow + 1) + ')';
+        document.getElementById('modal-overlay').classList.add('open');
 
-            appendRowsToTable(data.rows, startDisplay, data.originalIndices);
-            updateStatus(); updateLoadMoreButton();
-            break;
-        }
-
-        case 'searchError':
-            document.getElementById('search-error').textContent = '⚠ ' + data.message;
-            break;
-
-        case 'cellContent': {
-            const key = data.row + ',' + data.col;
-            cellCache.set(key, data.text);
-            if (editingCell.row === data.row && editingCell.col === data.col) showTextContent(data.text);
-            break;
-        }
-
-        case 'cellJsonNode': {
-            if (data.row !== jsonRow || data.col !== jsonCol) break;
-            if (JSON.stringify(data.path) !== JSON.stringify(jsonPath)) break;
-            renderJsonNode(data.node, data.offset > 0, data.offset);
-            break;
-        }
-
-        case 'jsonScalar': {
-            if (data.row !== jsonRow || data.col !== jsonCol) break;
-            startInlineEdit(data.raw, data.vtype);
-            break;
-        }
-
-        case 'progress': {
-            loadBytesRead = data.bytesRead;
-            loadTotalBytes = data.totalBytes;
-            updateLoadingProgress();
-            break;
-        }
-
-        case 'cellPreviewUpdated': {
-            const displayedRi = rowOriginalIndices.indexOf(data.row);
-            if (displayedRi >= 0 && rows[displayedRi]) {
-                rows[displayedRi] = rows[displayedRi].map((cell, ci) =>
-                    ci === data.col ? { ...cell, v: data.preview } : cell);
-            }
-            break;
+        if (cell.lazy && cell.json) {
+            this._enterJsonMode(origRow, ci);
+        } else {
+            this._enterTextMode(origRow, ci, cell);
         }
     }
-});
 
-// Notify the extension that the webview JS is ready to receive messages.
-// loadFile() waits for this before starting to stream rows.
-vscode.postMessage({ type: 'ready' });
+    close() {
+        document.getElementById('modal-overlay').classList.remove('open');
+        this.pendingScalarEdit = null;
+    }
+
+    handleCellContent(data) {
+        this.cellCache.set(data.row + ',' + data.col, data.text);
+        if (this.editingCell.row === data.row && this.editingCell.col === data.col) {
+            this._showTextContent(data.text);
+        }
+    }
+
+    handleJsonNode(data) {
+        if (data.row !== this.jsonRow || data.col !== this.jsonCol) return;
+        if (JSON.stringify(data.path) !== JSON.stringify(this.jsonPath)) return;
+        this._renderJsonNode(data.node, data.offset > 0, data.offset);
+    }
+
+    handleJsonScalar(data) {
+        if (data.row !== this.jsonRow || data.col !== this.jsonCol) return;
+        this._startInlineEdit(data.raw, data.vtype);
+    }
+
+    handlePreviewUpdated(data, rows, rowOriginalIndices) {
+        const displayedRi = rowOriginalIndices.indexOf(data.row);
+        if (displayedRi >= 0 && rows[displayedRi]) {
+            rows[displayedRi] = rows[displayedRi].map((cell, ci) =>
+                ci === data.col ? { ...cell, v: data.preview } : cell);
+        }
+    }
+
+    _bindEvents() {
+        document.getElementById('modal-close').onclick = () => this.close();
+        document.getElementById('modal-overlay').onclick = e => {
+            if (e.target === document.getElementById('modal-overlay')) this.close();
+        };
+        document.getElementById('btn-cancel').onclick = () => this.close();
+        document.getElementById('btn-save-cell').onclick = () => this._handleSave();
+    }
+
+    _enterTextMode(origRow, ci, cell) {
+        document.getElementById('modal-textarea').style.display = 'block';
+        document.getElementById('modal-footer').style.display = 'flex';
+        document.getElementById('json-breadcrumb').style.display = 'none';
+        document.getElementById('json-tree-view').style.display = 'none';
+
+        const key = origRow + ',' + ci;
+        if (cell.lazy && !this.cellCache.has(key)) {
+            const ta = document.getElementById('modal-textarea');
+            ta.value = 'Loading...';
+            ta.disabled = true;
+            document.getElementById('btn-save-cell').disabled = true;
+            this.vscode.postMessage({ type: 'getCellContent', row: origRow, col: ci });
+        } else {
+            this._showTextContent(cell.lazy ? this.cellCache.get(key) : cell.v);
+        }
+    }
+
+    _showTextContent(raw) {
+        let display = raw;
+        if (looksLikeJson(raw)) {
+            try { display = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
+        }
+        const ta = document.getElementById('modal-textarea');
+        ta.value = display;
+        ta.disabled = false;
+        document.getElementById('btn-save-cell').disabled = false;
+        ta.focus();
+    }
+
+    _handleSave() {
+        const { row, col } = this.editingCell;
+        let value = document.getElementById('modal-textarea').value;
+        const errEl = document.getElementById('modal-error');
+        const key = row + ',' + col;
+        const rows = this.getRows();
+        const displayedRi = rows.findIndex((_, i) => this.getOriginalIndex(i) === row);
+        const cell = rows[displayedRi]?.[col];
+        if (!cell) return;
+
+        const originalRaw = cell.lazy ? (this.cellCache.get(key) ?? '') : cell.v;
+        if (looksLikeJson(originalRaw)) {
+            try { value = JSON.stringify(JSON.parse(value)); }
+            catch (e) { errEl.textContent = 'Invalid JSON: ' + e.message; errEl.style.display = 'block'; return; }
+        }
+
+        const isJson = looksLikeJson(value);
+        if (cell.lazy) {
+            this.cellCache.set(key, value);
+            rows[displayedRi][col] = { v: value.slice(0, 80), lazy: true, json: isJson };
+        } else {
+            rows[displayedRi][col] = { v: value, lazy: false, json: isJson };
+        }
+
+        this.onTableCellUpdated(row, col, value, isJson, displayedRi);
+        this.close();
+        this.vscode.postMessage({ type: 'editCell', row, col, value });
+    }
+
+    _enterJsonMode(origRow, ci) {
+        this.jsonRow = origRow;
+        this.jsonCol = ci;
+        this.jsonPath = [];
+        this.pendingScalarEdit = null;
+
+        document.getElementById('modal-textarea').style.display = 'none';
+        document.getElementById('modal-footer').style.display = 'none';
+        document.getElementById('json-breadcrumb').style.display = 'flex';
+        document.getElementById('json-tree-view').style.display = 'block';
+
+        this._renderBreadcrumb();
+        this._setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
+        this.vscode.postMessage({ type: 'getCellJson', row: origRow, col: ci });
+    }
+
+    _setTreeHTML(html) { document.getElementById('json-tree-view').innerHTML = html; }
+
+    _renderBreadcrumb() {
+        const el = document.getElementById('json-breadcrumb');
+        el.innerHTML = '';
+        const addCrumb = (label, path) => {
+            const span = Object.assign(document.createElement('span'), { className: 'bc-item', textContent: label });
+            span.onclick = () => this._navigateTo(path);
+            el.appendChild(span);
+        };
+        addCrumb('root', []);
+        this.jsonPath.forEach((seg, idx) => {
+            el.appendChild(Object.assign(document.createElement('span'), { className: 'bc-sep', textContent: ' › ' }));
+            addCrumb(String(seg), this.jsonPath.slice(0, idx + 1));
+        });
+    }
+
+    _navigateTo(path) {
+        this.jsonPath = path;
+        this._renderBreadcrumb();
+        this._setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
+        this.vscode.postMessage({ type: 'expandJsonPath', row: this.jsonRow, col: this.jsonCol, path });
+    }
+
+    _renderJsonNode(node, appendMode, offset) {
+        const container = document.getElementById('json-tree-view');
+        if (!appendMode) container.innerHTML = '';
+
+        if (node.kind === 'scalar') { this._renderScalarRoot(container, node); return; }
+
+        let ul = appendMode ? container.querySelector('.jtree') : null;
+        if (!ul) { ul = document.createElement('ul'); ul.className = 'jtree'; container.appendChild(ul); }
+
+        const existingMore = container.querySelector('.jmore-btn');
+        if (existingMore) existingMore.remove();
+
+        if (node.kind === 'object') {
+            node.entries.forEach(({ key, preview, vtype }) =>
+                ul.appendChild(this._createEntry('"' + key + '"', 'jkey', key, preview, vtype)));
+        } else if (node.kind === 'array') {
+            node.items.forEach(({ preview, vtype }, idx) =>
+                ul.appendChild(this._createEntry('[' + (offset + idx) + ']', 'jindex', offset + idx, preview, vtype)));
+        }
+
+        if (node.shown < node.total) {
+            const shown = node.shown;
+            const btn = Object.assign(document.createElement('button'), {
+                className: 'jmore-btn',
+                textContent: '↓ Load more (' + shown + ' / ' + node.total + ' shown)',
+            });
+            btn.onclick = () => {
+                btn.disabled = true; btn.textContent = 'Loading…';
+                this.vscode.postMessage({ type: 'expandJsonPath', row: this.jsonRow, col: this.jsonCol, path: this.jsonPath, offset: shown });
+            };
+            container.appendChild(btn);
+        }
+    }
+
+    _renderScalarRoot(container, node) {
+        const div = document.createElement('div');
+        div.style.cssText = 'padding:8px 6px;display:flex;align-items:baseline;gap:10px;';
+        const valEl = Object.assign(document.createElement('span'), { className: 'jval-' + node.vtype, textContent: node.display });
+        const editBtn = Object.assign(document.createElement('button'), { className: 'jedit-btn', textContent: 'Edit' });
+        editBtn.style.opacity = '1';
+        editBtn.onclick = () => {
+            this.pendingScalarEdit = { el: valEl, li: div, path: [...this.jsonPath], vtype: node.vtype };
+            this.vscode.postMessage({ type: 'getJsonScalar', row: this.jsonRow, col: this.jsonCol, path: this.jsonPath });
+        };
+        div.appendChild(valEl);
+        div.appendChild(editBtn);
+        container.appendChild(div);
+    }
+
+    _createEntry(label, labelClass, keyOrIndex, preview, vtype) {
+        const li = document.createElement('li');
+        li.appendChild(Object.assign(document.createElement('span'), { className: labelClass, textContent: label + ':' }));
+
+        const isNavigable = vtype === 'object' || vtype === 'array';
+        const valEl = Object.assign(document.createElement('span'), {
+            className: isNavigable ? 'jnav' : ('jval-' + vtype),
+            textContent: preview,
+        });
+        li.appendChild(valEl);
+
+        if (isNavigable) {
+            valEl.onclick = () => {
+                this.jsonPath = [...this.jsonPath, keyOrIndex];
+                this._renderBreadcrumb();
+                this._setTreeHTML('<span style="color:var(--vscode-descriptionForeground);padding:8px 0;display:block">Loading…</span>');
+                this.vscode.postMessage({ type: 'expandJsonPath', row: this.jsonRow, col: this.jsonCol, path: this.jsonPath });
+            };
+        } else {
+            const editBtn = Object.assign(document.createElement('button'), { className: 'jedit-btn', textContent: 'Edit' });
+            editBtn.onclick = () => {
+                this.pendingScalarEdit = { el: valEl, li, path: [...this.jsonPath, keyOrIndex], vtype };
+                this.vscode.postMessage({ type: 'getJsonScalar', row: this.jsonRow, col: this.jsonCol, path: [...this.jsonPath, keyOrIndex] });
+            };
+            li.appendChild(editBtn);
+        }
+        return li;
+    }
+
+    _startInlineEdit(raw, vtype) {
+        if (!this.pendingScalarEdit) return;
+        const { el, li, path } = this.pendingScalarEdit;
+        this.pendingScalarEdit = null;
+        el.style.display = 'none';
+
+        const isLong = raw.length > 60;
+        const input = isLong
+            ? Object.assign(document.createElement('textarea'), { rows: Math.min(Math.ceil(raw.length / 60), 6) })
+            : Object.assign(document.createElement('input'), { type: 'text' });
+        if (isLong) input.style.resize = 'vertical';
+        input.className = 'jinput';
+        input.value = raw;
+
+        const saveBtn   = Object.assign(document.createElement('button'), { className: 'jinput-save',   textContent: isLong ? 'Save (Ctrl+Enter)' : 'Save (Enter)' });
+        const cancelBtn = Object.assign(document.createElement('button'), { className: 'jinput-cancel', textContent: 'Cancel' });
+        const btnRow = Object.assign(document.createElement('div'), { className: 'jinput-btns' });
+        btnRow.appendChild(saveBtn); btnRow.appendChild(cancelBtn);
+
+        const wrap = Object.assign(document.createElement('div'), { className: 'jinput-wrap' });
+        wrap.appendChild(input); wrap.appendChild(btnRow);
+        li.appendChild(wrap);
+        input.focus();
+
+        const cleanup = () => { wrap.remove(); el.style.display = ''; };
+        const save = () => {
+            const newRaw = input.value;
+            let newValue;
+            if (vtype === 'string') { newValue = newRaw; }
+            else { try { newValue = JSON.parse(newRaw); } catch { newValue = newRaw; } }
+            cleanup();
+            const newVtype = newValue === null ? 'null' : typeof newValue;
+            el.className = 'jval-' + newVtype;
+            el.textContent = typeof newValue === 'string' ? JSON.stringify(newValue) : String(newValue);
+            const note = Object.assign(document.createElement('span'), { className: 'jsaved-note', textContent: '✓ Saved' });
+            li.appendChild(note);
+            setTimeout(() => note.remove(), 1500);
+            this.vscode.postMessage({ type: 'saveJsonPath', row: this.jsonRow, col: this.jsonCol, path, value: newValue });
+        };
+        saveBtn.onclick = save;
+        cancelBtn.onclick = cleanup;
+        input.addEventListener('keydown', e => {
+            if (e.key === 'Escape') cleanup();
+            if (e.key === 'Enter' && (e.ctrlKey || input.tagName !== 'TEXTAREA')) save();
+        });
+    }
+}
+
+// ── CsvApp ─────────────────────────────────────────────────────────────────────
+// Main application class. Owns all state, handles extension messages,
+// and coordinates TableView and CellModal.
+class CsvApp {
+    constructor() {
+        // Table state
+        this.rows = [];
+        this.rowOriginalIndices = [];
+        this.headers = [];
+        this.totalRows = 0;
+        this.loadedCount = 0;
+        this.hasMore = false;
+        this.isLoading = false;
+        this.loadBytesRead = 0;
+        this.loadTotalBytes = 0;
+
+        // Search state
+        this.isSearchMode = false;
+        this.searchTotalMatches = 0;
+        this.searchLoadedCount = 0;
+        this.searchHasMore = false;
+
+        this.tableView = new TableView((ri, ci) => this.modal.open(ri, ci, this.headers));
+        this.modal = new CellModal(
+            vscode,
+            () => this.rows,
+            (i) => this._origIndex(i),
+            (origRow, ci, value, isJson, displayedRi) =>
+                this.tableView.updateCell(origRow, ci, value, isJson, displayedRi),
+        );
+
+        this._bindEvents();
+        window.addEventListener('message', ({ data }) => this._handleMessage(data));
+        vscode.postMessage({ type: 'ready' });
+    }
+
+    _origIndex(displayedRi) { return this.rowOriginalIndices[displayedRi] ?? displayedRi; }
+
+    _bindEvents() {
+        document.getElementById('btn-search').onclick = () => this._doSearch();
+        document.getElementById('btn-clear-search').onclick = () => this._doClearSearch();
+        document.getElementById('search-input').addEventListener('keydown', e => {
+            if (e.key === 'Enter') this._doSearch();
+            if (e.key === 'Escape') this._doClearSearch();
+        });
+        document.getElementById('btn-load-more').onclick = () => {
+            document.getElementById('btn-load-more').disabled = true;
+            if (this.isSearchMode) {
+                vscode.postMessage({ type: 'requestSearchPage', start: this.searchLoadedCount });
+            } else {
+                vscode.postMessage({ type: 'requestPage', start: this.loadedCount });
+            }
+        };
+    }
+
+    _doSearch() {
+        document.getElementById('search-error').textContent = '';
+        vscode.postMessage({ type: 'search', query: document.getElementById('search-input').value.trim() });
+    }
+
+    _doClearSearch() {
+        this.isSearchMode = false;
+        document.getElementById('search-input').value = '';
+        document.getElementById('btn-clear-search').style.display = 'none';
+        document.getElementById('search-error').textContent = '';
+        vscode.postMessage({ type: 'clearSearch' });
+    }
+
+    _updateStatus() {
+        const el = document.getElementById('status');
+        if (this.isSearchMode) {
+            const shown = this.searchHasMore ? this.searchLoadedCount + ' / ' + this.searchTotalMatches : String(this.searchTotalMatches);
+            el.innerHTML = shown + ' 件ヒット (全 ' + this.totalRows + ' 行, ' + this.headers.length + ' 列)';
+        } else if (this.isLoading) {
+            el.innerHTML = this.loadedCount + ' 行表示中 <span id="loading-indicator">読み込み中...</span>';
+        } else {
+            const shown = this.hasMore ? this.loadedCount + ' / ' + this.totalRows : String(this.totalRows);
+            el.textContent = shown + ' 行, ' + this.headers.length + ' 列';
+        }
+    }
+
+    _updateLoadingProgress() {
+        const stats = document.getElementById('loading-stats');
+        if (!stats) return;
+        const fill = document.getElementById('loading-progress-fill');
+        if (this.loadTotalBytes > 0) {
+            const pct = Math.min(100, Math.round(this.loadBytesRead / this.loadTotalBytes * 100));
+            fill.style.setProperty('--pct', pct + '%');
+            fill.classList.add('determinate');
+            stats.textContent = (this.loadBytesRead / 1024 / 1024).toFixed(0) + ' MB / '
+                + (this.loadTotalBytes / 1024 / 1024).toFixed(0) + ' MB  (' + pct + '%)  —  ' + this.loadedCount + ' 行';
+        } else {
+            stats.textContent = this.loadedCount > 0 ? this.loadedCount + ' 行読み込み済み...' : '';
+        }
+    }
+
+    _setSearchEnabled(enabled) {
+        const input = document.getElementById('search-input');
+        const btn = document.getElementById('btn-search');
+        input.disabled = !enabled;
+        btn.disabled = !enabled;
+        input.placeholder = enabled
+            ? '例: label = "cat"  /  score >= 0.9 AND name contains "Alice"  /  (a = "x" OR b = "y") AND c != "z"'
+            : '読み込み完了後に検索できます';
+    }
+
+    _updateLoadMoreButton() {
+        const row = document.getElementById('load-more-row');
+        const btn = document.getElementById('btn-load-more');
+        const active = !this.isLoading && (this.isSearchMode ? this.searchHasMore : this.hasMore);
+        if (active) {
+            const loaded = this.isSearchMode ? this.searchLoadedCount : this.loadedCount;
+            const total  = this.isSearchMode ? this.searchTotalMatches : this.totalRows;
+            row.style.display = '';
+            document.getElementById('load-more-cell').colSpan = this.headers.length + 1;
+            btn.disabled = false;
+            btn.textContent = 'さらに読み込む (' + loaded + ' / ' + total + ')';
+        } else {
+            row.style.display = 'none';
+        }
+    }
+
+    _handleMessage(data) {
+        switch (data.type) {
+            case 'load': {
+                this.isSearchMode = false;
+                this.isLoading = !!data.isLoading;
+                this.loadBytesRead = 0; this.loadTotalBytes = 0;
+                this.headers = data.headers;
+                this.rows = []; this.rowOriginalIndices = [];
+                this.totalRows = 0; this.hasMore = false; this.loadedCount = 0;
+                this.modal.clearCache();
+                this.tableView.buildHeader(this.headers);
+                this.tableView.clearBody();
+                document.getElementById('loading').style.display = this.isLoading ? 'flex' : 'none';
+                if (this.isLoading) document.getElementById('loading-title').textContent = 'CSV を読み込み中...';
+                document.getElementById('toolbar').style.display = 'flex';
+                document.getElementById('search-bar').style.display = 'flex';
+                document.getElementById('table-container').style.display = 'block';
+                document.getElementById('btn-clear-search').style.display = 'none';
+                this._setSearchEnabled(!this.isLoading);
+                this._updateStatus(); this._updateLoadMoreButton(); this._updateLoadingProgress();
+                break;
+            }
+
+            case 'streamRows': {
+                const start = this.rows.length;
+                this.rows = this.rows.concat(data.rows);
+                this.rowOriginalIndices = this.rowOriginalIndices.concat(data.rows.map((_, i) => start + i));
+                this.loadedCount = this.rows.length;
+                this.tableView.appendRows(data.rows, start, null);
+                this._updateStatus(); this._updateLoadingProgress();
+                break;
+            }
+
+            case 'loadComplete':
+                this.isLoading = false;
+                this.totalRows = data.totalRows;
+                this.hasMore = data.hasMore;
+                document.getElementById('loading').style.display = 'none';
+                this._setSearchEnabled(true);
+                this._updateStatus(); this._updateLoadMoreButton();
+                break;
+
+            case 'appendRows': {
+                const start = this.rows.length;
+                this.rows = this.rows.concat(data.rows);
+                this.rowOriginalIndices = this.rowOriginalIndices.concat(data.rows.map((_, i) => start + i));
+                this.hasMore = data.hasMore;
+                this.loadedCount = this.rows.length;
+                this.tableView.appendRows(data.rows, start, null);
+                this._updateStatus(); this._updateLoadMoreButton();
+                break;
+            }
+
+            case 'searchResults': {
+                this.isSearchMode = true;
+                this.searchTotalMatches = data.totalMatches;
+                this.searchHasMore = data.hasMore;
+                document.getElementById('search-error').textContent = '';
+                document.getElementById('btn-clear-search').style.display = '';
+                if (data.pageStart === 0) {
+                    this.rows = []; this.rowOriginalIndices = [];
+                    this.searchLoadedCount = 0;
+                    this.tableView.clearBody();
+                }
+                const start = this.rows.length;
+                this.rows = this.rows.concat(data.rows);
+                this.rowOriginalIndices = this.rowOriginalIndices.concat(data.originalIndices);
+                this.searchLoadedCount = this.rows.length;
+                this.tableView.appendRows(data.rows, start, data.originalIndices);
+                this._updateStatus(); this._updateLoadMoreButton();
+                break;
+            }
+
+            case 'searchError':
+                document.getElementById('search-error').textContent = '⚠ ' + data.message;
+                break;
+
+            case 'cellContent':        this.modal.handleCellContent(data);   break;
+            case 'cellJsonNode':       this.modal.handleJsonNode(data);       break;
+            case 'jsonScalar':         this.modal.handleJsonScalar(data);     break;
+            case 'cellPreviewUpdated': this.modal.handlePreviewUpdated(data, this.rows, this.rowOriginalIndices); break;
+
+            case 'progress':
+                this.loadBytesRead = data.bytesRead;
+                this.loadTotalBytes = data.totalBytes;
+                this._updateLoadingProgress();
+                break;
+        }
+    }
+}
+
+new CsvApp();
 </script>
 </body>
 </html>`;
