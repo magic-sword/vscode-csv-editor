@@ -1,10 +1,12 @@
 import {
     forwardRef, useImperativeHandle, useEffect, useRef, useState,
 } from 'react';
-import { vscode } from '../vscode';
-import { CellData, JsonNode, JsonPath } from '../types';
+import { vscode } from '../../vscode';
+import { CellData, JsonNode, JsonPath } from '../../types';
+import { InlineEdit } from './types';
+import JsonTreeView from './JsonTreeView';
 
-// ── Types ──────────────────────────────────────────────────────────────────────
+// ── Public handle ──────────────────────────────────────────────────────────────
 
 export interface CellModalHandle {
     clearCache: () => void;
@@ -23,7 +25,7 @@ interface Props {
     onUpdateCell: (displayedRi: number, col: number, cell: CellData) => void;
 }
 
-type InlineEdit = { path: JsonPath; raw: string; vtype: string };
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function looksLikeJson(s: string) {
     const t = s.trim();
@@ -37,161 +39,6 @@ function formatForDisplay(raw: string): string {
     return raw;
 }
 
-// ── JsonTreeView ───────────────────────────────────────────────────────────────
-// Renders one level of the JSON tree and handles navigation / inline editing.
-
-function JsonTreeView({
-    node, path, jsonRow, jsonCol, onNavigate, onRequestEdit, inlineEdit, onSaveEdit, onCancelEdit, onLoadMore,
-}: {
-    node: JsonNode;
-    path: JsonPath;
-    jsonRow: number;
-    jsonCol: number;
-    onNavigate: (path: JsonPath) => void;
-    onRequestEdit: (path: JsonPath) => void;
-    inlineEdit: InlineEdit | null;
-    onSaveEdit: (path: JsonPath, value: unknown) => void;
-    onCancelEdit: () => void;
-    onLoadMore: (shown: number) => void;
-}) {
-    if (node.kind === 'scalar') {
-        return (
-            <div style={{ padding: '8px 6px', display: 'flex', alignItems: 'baseline', gap: 10 }}>
-                <span className={`jval-${node.vtype}`}>{node.display}</span>
-                {inlineEdit && JSON.stringify(inlineEdit.path) === JSON.stringify(path) ? (
-                    <InlineEditor
-                        raw={inlineEdit.raw}
-                        vtype={inlineEdit.vtype}
-                        onSave={v => onSaveEdit(path, v)}
-                        onCancel={onCancelEdit}
-                    />
-                ) : (
-                    <button className="jedit-btn jedit-btn-root" onClick={() => onRequestEdit(path)}>Edit</button>
-                )}
-            </div>
-        );
-    }
-
-    const entries = node.kind === 'object' ? node.entries : null;
-    const items   = node.kind === 'array'  ? node.items   : null;
-
-    return (
-        <>
-            <ul className="jtree">
-                {entries?.map(({ key, preview, vtype }) => {
-                    const childPath = [...path, key];
-                    const isNav = vtype === 'object' || vtype === 'array';
-                    const isEditing = inlineEdit && JSON.stringify(inlineEdit.path) === JSON.stringify(childPath);
-                    return (
-                        <li key={key}>
-                            <span className="jkey">&quot;{key}&quot;:</span>
-                            {isEditing ? (
-                                <InlineEditor
-                                    raw={inlineEdit!.raw}
-                                    vtype={inlineEdit!.vtype}
-                                    onSave={v => onSaveEdit(childPath, v)}
-                                    onCancel={onCancelEdit}
-                                />
-                            ) : isNav ? (
-                                <span className="jnav" onClick={() => onNavigate(childPath)}>{preview}</span>
-                            ) : (
-                                <>
-                                    <span className={`jval-${vtype}`}>{preview}</span>
-                                    <button className="jedit-btn" onClick={() => onRequestEdit(childPath)}>Edit</button>
-                                </>
-                            )}
-                        </li>
-                    );
-                })}
-                {items?.map(({ preview, vtype }, idx) => {
-                    const offset = node.shown - items.length;
-                    const absIdx = offset + idx;
-                    const childPath = [...path, absIdx];
-                    const isNav = vtype === 'object' || vtype === 'array';
-                    const isEditing = inlineEdit && JSON.stringify(inlineEdit.path) === JSON.stringify(childPath);
-                    return (
-                        <li key={absIdx}>
-                            <span className="jindex">[{absIdx}]:</span>
-                            {isEditing ? (
-                                <InlineEditor
-                                    raw={inlineEdit!.raw}
-                                    vtype={inlineEdit!.vtype}
-                                    onSave={v => onSaveEdit(childPath, v)}
-                                    onCancel={onCancelEdit}
-                                />
-                            ) : isNav ? (
-                                <span className="jnav" onClick={() => onNavigate(childPath)}>{preview}</span>
-                            ) : (
-                                <>
-                                    <span className={`jval-${vtype}`}>{preview}</span>
-                                    <button className="jedit-btn" onClick={() => onRequestEdit(childPath)}>Edit</button>
-                                </>
-                            )}
-                        </li>
-                    );
-                })}
-            </ul>
-            {node.shown < node.total && (
-                <button className="jmore-btn" onClick={() => onLoadMore(node.shown)}>
-                    ↓ Load more ({node.shown} / {node.total} shown)
-                </button>
-            )}
-        </>
-    );
-
-    // Suppress unused-variable warnings for jsonRow/jsonCol — they're only for key stability
-    void jsonRow; void jsonCol;
-}
-
-// ── InlineEditor ───────────────────────────────────────────────────────────────
-
-function InlineEditor({ raw, vtype, onSave, onCancel }: {
-    raw: string; vtype: string;
-    onSave: (value: unknown) => void;
-    onCancel: () => void;
-}) {
-    const [value, setValue] = useState(raw);
-    const isLong = raw.length > 60;
-
-    const save = () => {
-        let parsed: unknown;
-        if (vtype === 'string') { parsed = value; }
-        else { try { parsed = JSON.parse(value); } catch { parsed = value; } }
-        onSave(parsed);
-    };
-
-    return (
-        <span className="jinput-wrap">
-            {isLong ? (
-                <textarea
-                    className="jinput"
-                    rows={Math.min(Math.ceil(raw.length / 60), 6)}
-                    style={{ resize: 'vertical' }}
-                    value={value}
-                    onChange={e => setValue(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Escape') onCancel(); if (e.key === 'Enter' && e.ctrlKey) save(); }}
-                    autoFocus
-                />
-            ) : (
-                <input
-                    className="jinput"
-                    type="text"
-                    value={value}
-                    onChange={e => setValue(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Escape') onCancel(); if (e.key === 'Enter') save(); }}
-                    autoFocus
-                />
-            )}
-            <span className="jinput-btns">
-                <button className="jinput-save" onClick={save}>
-                    {isLong ? 'Save (Ctrl+Enter)' : 'Save (Enter)'}
-                </button>
-                <button className="jinput-cancel" onClick={onCancel}>Cancel</button>
-            </span>
-        </span>
-    );
-}
-
 // ── CellModal ──────────────────────────────────────────────────────────────────
 
 const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
@@ -201,27 +48,22 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
     const origRow = getOriginalIndex(displayedRi);
     const cell    = getRows()[displayedRi]?.[ci];
 
-    // Text mode state
     const [textContent, setTextContent] = useState('');
     const [textLoading, setTextLoading] = useState(false);
-    const [saveError, setSaveError] = useState('');
+    const [saveError,   setSaveError]   = useState('');
+    const [jsonPath,    setJsonPath]    = useState<JsonPath>([]);
+    const [jsonNode,    setJsonNode]    = useState<JsonNode | null>(null);
+    const [inlineEdit,  setInlineEdit]  = useState<InlineEdit | null>(null);
+    const [savedNote,   setSavedNote]   = useState<JsonPath | null>(null);
 
-    // JSON tree state
-    const [jsonPath, setJsonPath] = useState<JsonPath>([]);
-    const [jsonNode, setJsonNode] = useState<JsonNode | null>(null);
-    const [inlineEdit, setInlineEdit] = useState<InlineEdit | null>(null);
-    const [savedNote, setSavedNote] = useState<JsonPath | null>(null);
-
-    // Stable refs for use in imperative handle (avoids stale closures)
+    // Refs keep modal callbacks free of stale closures.
     const jsonRowRef  = useRef(-1);
     const jsonColRef  = useRef(-1);
     const jsonPathRef = useRef<JsonPath>([]);
-
     const cellCacheRef = useRef<Map<string, string>>(new Map());
 
     const mode = cell?.lazy && cell?.json ? 'json' : 'text';
 
-    // Initialize when cell changes (modal opened for a new cell)
     useEffect(() => {
         setSaveError('');
         setInlineEdit(null);
@@ -278,7 +120,8 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
         },
     }), [origRow, ci]);
 
-    // ── Text mode: save ──
+    // ── Text mode ──────────────────────────────────────────────────────────────
+
     const handleTextSave = () => {
         const key = `${origRow},${ci}`;
         let value = textContent;
@@ -298,7 +141,8 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
         onClose();
     };
 
-    // ── JSON tree: navigation ──
+    // ── JSON tree navigation ───────────────────────────────────────────────────
+
     const navigateTo = (path: JsonPath) => {
         jsonPathRef.current = path;
         setJsonPath(path);
@@ -314,7 +158,6 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
     const saveEdit = (path: JsonPath, value: unknown) => {
         setInlineEdit(null);
         const newVtype = value === null ? 'null' : typeof value;
-        // Update the displayed preview in the node
         setJsonNode(prev => {
             if (!prev || prev.kind === 'scalar') return prev;
             if (prev.kind === 'object') {
@@ -352,13 +195,13 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
         vscode.postMessage({ type: 'expandJsonPath', row: jsonRowRef.current, col: jsonColRef.current, path: jsonPathRef.current, offset: shown });
     };
 
-    const title = `${headers[ci]}  (行 ${origRow + 1})`;
+    // ── Render ─────────────────────────────────────────────────────────────────
 
     return (
         <div className="modal-overlay open" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
             <div className="modal">
                 <div className="modal-header">
-                    <span className="modal-title">{title}</span>
+                    <span className="modal-title">{headers[ci]}  (行 {origRow + 1})</span>
                     <button className="modal-close" onClick={onClose}>✕</button>
                 </div>
 
@@ -401,11 +244,9 @@ const CellModal = forwardRef<CellModalHandle, Props>(function CellModal(
                                     <JsonTreeView
                                         node={jsonNode}
                                         path={jsonPath}
-                                        jsonRow={jsonRowRef.current}
-                                        jsonCol={jsonColRef.current}
+                                        inlineEdit={inlineEdit}
                                         onNavigate={navigateTo}
                                         onRequestEdit={requestEdit}
-                                        inlineEdit={inlineEdit}
                                         onSaveEdit={saveEdit}
                                         onCancelEdit={() => setInlineEdit(null)}
                                         onLoadMore={loadMore}

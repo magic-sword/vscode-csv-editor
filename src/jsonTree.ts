@@ -1,5 +1,6 @@
 export const TREE_PAGE = 50;
 
+export type JsonPath   = (string | number)[];
 export type ScalarNode = { kind: 'scalar'; vtype: string; display: string; raw: string };
 export type ObjectNode = { kind: 'object'; entries: { key: string; preview: string; vtype: string }[]; total: number; shown: number };
 export type ArrayNode  = { kind: 'array';  items:   { preview: string; vtype: string }[];              total: number; shown: number };
@@ -47,7 +48,7 @@ export function summarizeNode(v: unknown, offset = 0): JsonNode {
     };
 }
 
-export function getAtPath(root: unknown, path: (string | number)[]): unknown {
+export function getAtPath(root: unknown, path: JsonPath): unknown {
     let cur = root;
     for (const key of path) {
         if (cur === null || typeof cur !== 'object') return undefined;
@@ -56,7 +57,7 @@ export function getAtPath(root: unknown, path: (string | number)[]): unknown {
     return cur;
 }
 
-export function setAtPath(root: unknown, path: (string | number)[], newVal: unknown): void {
+export function setAtPath(root: unknown, path: JsonPath, newVal: unknown): void {
     if (path.length === 0) return;
     let cur = root as Record<string | number, unknown>;
     for (let i = 0; i < path.length - 1; i++) cur = cur[path[i]] as Record<string | number, unknown>;

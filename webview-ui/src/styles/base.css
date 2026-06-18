@@ -1,0 +1,2 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--vscode-font-family); font-size: 13px; color: var(--vscode-foreground); background: var(--vscode-editor-background); height: 100vh; display: flex; flex-direction: column; }

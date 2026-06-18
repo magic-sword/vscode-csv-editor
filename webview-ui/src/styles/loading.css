@@ -1,0 +1,9 @@
+/* ── Loading overlay ── */
+.loading-overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--vscode-editor-background); z-index: 200; }
+.loading-content { display: flex; flex-direction: column; align-items: center; gap: 14px; min-width: 300px; }
+.loading-title { font-size: 14px; }
+.loading-progress-track { width: 100%; height: 4px; background: var(--vscode-panel-border); border-radius: 2px; overflow: hidden; }
+@keyframes loading-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+.loading-progress-fill { height: 100%; width: 25%; background: var(--vscode-progressBar-background, #0078d4); border-radius: 2px; animation: loading-slide 1.5s ease-in-out infinite; }
+.loading-progress-fill.determinate { width: var(--pct, 0%); animation: none; transition: width 0.15s linear; }
+.loading-stats { font-size: 11px; color: var(--vscode-descriptionForeground); text-align: center; min-height: 1em; }

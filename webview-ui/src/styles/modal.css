@@ -1,0 +1,46 @@
+/* ── Modal shell ── */
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; justify-content: center; align-items: center; }
+.modal-overlay.open { display: flex; }
+.modal { background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; width: 80vw; max-width: 900px; height: 70vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal-header { padding: 10px 14px; border-bottom: 1px solid var(--vscode-panel-border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+.modal-title { font-weight: bold; font-size: 12px; color: var(--vscode-descriptionForeground); }
+.modal-close { background: none; border: none; color: var(--vscode-foreground); cursor: pointer; font-size: 16px; padding: 0 4px; }
+
+/* ── Text mode ── */
+.modal-textarea { flex: 1; width: 100%; border: none; outline: none; resize: none; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; padding: 12px; }
+.modal-footer { padding: 8px 14px; border-top: 1px solid var(--vscode-panel-border); display: flex; gap: 8px; justify-content: flex-end; flex-shrink: 0; }
+.modal-footer button { padding: 4px 14px; border: none; cursor: pointer; border-radius: 2px; font-size: 12px; }
+.btn-save { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.btn-save:disabled { opacity: 0.5; cursor: default; }
+.btn-cancel { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+.modal-error { color: var(--vscode-errorForeground); font-size: 11px; padding: 4px 14px; flex-shrink: 0; }
+
+/* ── JSON tree mode ── */
+.json-breadcrumb { padding: 6px 14px; border-bottom: 1px solid var(--vscode-panel-border); display: flex; align-items: center; gap: 3px; flex-wrap: wrap; font-size: 11px; flex-shrink: 0; min-height: 30px; }
+.bc-item { color: var(--vscode-textLink-foreground); cursor: pointer; }
+.bc-item:hover { text-decoration: underline; }
+.bc-sep { color: var(--vscode-descriptionForeground); }
+.json-tree-view { flex: 1; overflow: auto; padding: 10px 14px; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+.jtree { list-style: none; padding: 0; margin: 0; }
+.jtree > li { padding: 3px 6px; display: flex; align-items: baseline; gap: 8px; border-radius: 3px; }
+.jtree > li:hover { background: var(--vscode-list-hoverBackground); }
+.jkey   { color: #9cdcfe; flex-shrink: 0; }
+.jindex { color: var(--vscode-descriptionForeground); flex-shrink: 0; }
+.jval-string  { color: #ce9178; word-break: break-all; }
+.jval-number  { color: #b5cea8; }
+.jval-boolean { color: #569cd6; }
+.jval-null    { color: #569cd6; font-style: italic; }
+.jnav { color: var(--vscode-textLink-foreground); cursor: pointer; font-style: italic; }
+.jnav:hover { text-decoration: underline; }
+.jedit-btn { background: none; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); cursor: pointer; font-size: 10px; padding: 0 5px; border-radius: 2px; opacity: 0; flex-shrink: 0; }
+.jtree > li:hover .jedit-btn { opacity: 1; }
+.jedit-btn-root { opacity: 1; }
+.jmore-btn { background: none; border: none; display: block; color: var(--vscode-textLink-foreground); cursor: pointer; font-size: 11px; padding: 6px 6px; }
+.jmore-btn:hover { text-decoration: underline; }
+.jmore-btn:disabled { opacity: 0.5; cursor: default; text-decoration: none; }
+.jinput-wrap { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.jinput { background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder); color: var(--vscode-input-foreground); font-family: inherit; font-size: inherit; padding: 2px 6px; border-radius: 2px; width: 100%; }
+.jinput-btns { display: flex; gap: 6px; }
+.jinput-save { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 2px 10px; border-radius: 2px; cursor: pointer; font-size: 11px; }
+.jinput-cancel { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; padding: 2px 10px; border-radius: 2px; cursor: pointer; font-size: 11px; }
+.jsaved-note { font-size: 10px; color: var(--vscode-descriptionForeground); padding: 2px 6px; }

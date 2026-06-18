@@ -5,9 +5,10 @@ import * as crypto from 'crypto';
 import { STORED_CELL_MAX, makeWebviewCells, makeWebviewRows, parseCsvRows, parseCsvRowsFromFile, readRowsFromFile, stringifyCsv } from './csvParser';
 import { parseQuery, evalExpr } from './queryFilter';
 import { summarizeNode, getAtPath, setAtPath, valueType } from './jsonTree';
+import { JsonPath, WebviewMsg } from './messages';
 
-const PAGE_SIZE        = 500;
-const STREAM_BATCH     = 50;
+const PAGE_SIZE         = 500;
+const STREAM_BATCH      = 50;
 const FLUSH_INTERVAL_MS = 50;
 
 // Returns a path that Node.js fs can open directly.
@@ -25,15 +26,27 @@ function getNativePath(uri: vscode.Uri): string | null {
 
 class CsvEditorPanel {
     private readonly panel: vscode.WebviewPanel;
+    private readonly canUseNativeFs: boolean;
+    private readonly nativePath: string;
+
+    // ── Persistent data state ────────────────────────────────────────────────────
     private rows: string[][] = [];
     private headers: string[] = [];
     private truncatedCells = new Set<string>();
+
+    // ── JSON tree cache ──────────────────────────────────────────────────────────
     private jsonCacheKey = '';
     private jsonCacheParsed: unknown = null;
+
+    // ── Search state ─────────────────────────────────────────────────────────────
     private searchResultIndices: number[] | null = null;
     private searchSeq = 0;
-    private readonly canUseNativeFs: boolean;
-    private readonly nativePath: string;
+
+    // ── Transient load state (valid only while loadFile() is running) ─────────────
+    private loadBatch: string[][] = [];
+    private loadSentToWebview = 0;
+    private loadLastFlushTime = 0;
+    private loadFirstRowFlushed = false;
 
     constructor(
         context: vscode.ExtensionContext,
@@ -50,11 +63,13 @@ class CsvEditorPanel {
         );
         this.panel.webview.html = this.buildWebviewHtml(context.extensionUri.fsPath, webviewDir);
         this.panel.webview.onDidReceiveMessage(
-            (msg) => this.handleMessage(msg as Record<string, unknown>),
+            (msg) => this.handleMessage(msg as WebviewMsg),
             undefined,
             context.subscriptions,
         );
     }
+
+    // ── Webview HTML ─────────────────────────────────────────────────────────────
 
     private buildWebviewHtml(extensionPath: string, webviewDir: vscode.Uri): string {
         const distDir = path.join(extensionPath, 'out', 'webview');
@@ -97,11 +112,14 @@ window.addEventListener('unhandledrejection', function(e) {
 </html>`;
     }
 
+    // ── Messaging ────────────────────────────────────────────────────────────────
+
     private post(msg: object): void {
         this.panel.webview.postMessage(msg);
     }
 
-    // Returns the full cell content, re-reading from file if the cell was stored truncated.
+    // ── Cell access ──────────────────────────────────────────────────────────────
+
     private async getFullCell(row: number, col: number): Promise<string> {
         const key = `${row},${col}`;
         if (this.truncatedCells.has(key) && this.canUseNativeFs) {
@@ -111,10 +129,36 @@ window.addEventListener('unhandledrejection', function(e) {
         return this.rows[row]?.[col] ?? '';
     }
 
+    // ── File loading ─────────────────────────────────────────────────────────────
+
+    private async flushBatch(): Promise<void> {
+        if (this.loadBatch.length === 0) { await new Promise<void>(resolve => setImmediate(resolve)); return; }
+        const startIndex = this.rows.length;
+        for (let bi = 0; bi < this.loadBatch.length; bi++) {
+            const rowIdx = startIndex + bi;
+            this.loadBatch[bi].forEach((cell, ci) => {
+                if (cell.length >= STORED_CELL_MAX) this.truncatedCells.add(`${rowIdx},${ci}`);
+            });
+            this.rows.push(this.loadBatch[bi]);
+        }
+        if (this.loadSentToWebview < PAGE_SIZE) {
+            const toSend = this.loadBatch.slice(0, PAGE_SIZE - this.loadSentToWebview);
+            this.post({ type: 'streamRows', rows: toSend.map(r => makeWebviewCells(r)), startIndex });
+            this.loadSentToWebview += toSend.length;
+        }
+        this.loadBatch = [];
+        this.loadLastFlushTime = Date.now();
+        await new Promise<void>(resolve => setImmediate(resolve));
+    }
+
     private async loadFile(): Promise<void> {
         this.rows = [];
         this.headers = [];
         this.truncatedCells.clear();
+        this.loadBatch = [];
+        this.loadSentToWebview = 0;
+        this.loadLastFlushTime = Date.now();
+        this.loadFirstRowFlushed = false;
 
         let lastProgressTime = 0;
         const sendProgress = (bytesRead: number, totalBytes: number) => {
@@ -124,8 +168,6 @@ window.addEventListener('unhandledrejection', function(e) {
             this.post({ type: 'progress', bytesRead, totalBytes });
         };
 
-        // Local and WSL-remote files: stream 1 MB chunks via Node's fs (fsPath is a native path).
-        // Other remote URIs (e.g. vscode-vfs): fall back to reading the whole file via VS Code API.
         const targetUri = this.targetUri;
         const iter = this.canUseNativeFs
             ? parseCsvRowsFromFile(this.nativePath, sendProgress, STORED_CELL_MAX)
@@ -139,44 +181,21 @@ window.addEventListener('unhandledrejection', function(e) {
         if (headerResult.done || !headerResult.value) return;
         this.headers = headerResult.value;
 
-        this.post({ type: 'load', headers: this.headers, rows: [], totalRows: 0, isLoading: true, hasMore: false, pageSize: PAGE_SIZE });
+        this.post({ type: 'load', headers: this.headers, rows: [], totalRows: 0, isLoading: true, hasMore: false });
         await new Promise<void>(resolve => setImmediate(resolve));
 
-        let batch: string[][] = [];
-        let sentToWebview = 0;
-        let lastFlushTime = Date.now();
-        let firstRowFlushed = false;
-
-        const flushBatch = async () => {
-            if (batch.length === 0) { await new Promise<void>(resolve => setImmediate(resolve)); return; }
-            const startIndex = this.rows.length;
-            for (let bi = 0; bi < batch.length; bi++) {
-                const rowIdx = startIndex + bi;
-                batch[bi].forEach((cell, ci) => {
-                    if (cell.length >= STORED_CELL_MAX) this.truncatedCells.add(`${rowIdx},${ci}`);
-                });
-                this.rows.push(batch[bi]);
-            }
-            if (sentToWebview < PAGE_SIZE) {
-                const toSend = batch.slice(0, PAGE_SIZE - sentToWebview);
-                this.post({ type: 'streamRows', rows: toSend.map(r => makeWebviewCells(r)), startIndex });
-                sentToWebview += toSend.length;
-            }
-            batch = [];
-            lastFlushTime = Date.now();
-            await new Promise<void>(resolve => setImmediate(resolve));
-        };
-
         for await (const row of iter) {
-            batch.push(row);
-            if (!firstRowFlushed || batch.length >= STREAM_BATCH || Date.now() - lastFlushTime >= FLUSH_INTERVAL_MS) {
-                await flushBatch();
-                firstRowFlushed = true;
+            this.loadBatch.push(row);
+            if (!this.loadFirstRowFlushed || this.loadBatch.length >= STREAM_BATCH || Date.now() - this.loadLastFlushTime >= FLUSH_INTERVAL_MS) {
+                await this.flushBatch();
+                this.loadFirstRowFlushed = true;
             }
         }
-        await flushBatch();
+        await this.flushBatch();
         this.post({ type: 'loadComplete', totalRows: this.rows.length, hasMore: this.rows.length > PAGE_SIZE });
     }
+
+    // ── File saving ──────────────────────────────────────────────────────────────
 
     private async saveFile(): Promise<void> {
         if (this.truncatedCells.size === 0) {
@@ -197,133 +216,129 @@ window.addEventListener('unhandledrejection', function(e) {
         await vscode.workspace.fs.writeFile(this.targetUri, Buffer.from(text, 'utf8'));
     }
 
-    private async handleMessage(msg: Record<string, unknown>): Promise<void> {
-        switch (msg.type) {
+    // ── Search handlers ──────────────────────────────────────────────────────────
 
+    private async handleSearch(query: string): Promise<void> {
+        const seq = ++this.searchSeq;
+        if (!query) {
+            this.searchResultIndices = null;
+            this.post({ type: 'load', headers: this.headers, rows: makeWebviewRows(this.rows, 0, PAGE_SIZE), totalRows: this.rows.length, hasMore: this.rows.length > PAGE_SIZE });
+            return;
+        }
+        let expr;
+        try { expr = parseQuery(query); }
+        catch (e) { this.post({ type: 'searchError', message: (e as Error).message }); return; }
+
+        const matched: number[] = [];
+        let ny = 10_000;
+        for (let i = 0; i < this.rows.length; i++) {
+            if (i >= ny) { ny = i + 10_000; await new Promise<void>(resolve => setImmediate(resolve)); }
+            if (seq !== this.searchSeq) return;
+            if (evalExpr(expr, this.rows[i], this.headers)) matched.push(i);
+        }
+        this.searchResultIndices = matched;
+        this.post({
+            type: 'searchResults',
+            totalMatches: matched.length,
+            rows: matched.slice(0, PAGE_SIZE).map(i => makeWebviewCells(this.rows[i])),
+            originalIndices: matched.slice(0, PAGE_SIZE),
+            hasMore: matched.length > PAGE_SIZE,
+            pageStart: 0,
+        });
+    }
+
+    private handleRequestSearchPage(start: number): void {
+        if (!this.searchResultIndices) return;
+        const pageIdx = this.searchResultIndices.slice(start, start + PAGE_SIZE);
+        this.post({
+            type: 'searchResults',
+            totalMatches: this.searchResultIndices.length,
+            rows: pageIdx.map(i => makeWebviewCells(this.rows[i])),
+            originalIndices: pageIdx,
+            hasMore: start + PAGE_SIZE < this.searchResultIndices.length,
+            pageStart: start,
+        });
+    }
+
+    private handleClearSearch(): void {
+        this.searchResultIndices = null;
+        this.post({ type: 'load', headers: this.headers, rows: makeWebviewRows(this.rows, 0, PAGE_SIZE), totalRows: this.rows.length, hasMore: this.rows.length > PAGE_SIZE });
+    }
+
+    // ── JSON cell handlers ───────────────────────────────────────────────────────
+
+    private async handleGetCellJson(row: number, col: number): Promise<void> {
+        const cacheKey = `${row},${col}`;
+        if (this.jsonCacheKey === cacheKey) {
+            this.post({ type: 'cellJsonNode', row, col, path: [], offset: 0, node: summarizeNode(this.jsonCacheParsed, 0) });
+            return;
+        }
+        const raw = await this.getFullCell(row, col);
+        let parsed: unknown;
+        try { parsed = JSON.parse(raw); this.jsonCacheKey = cacheKey; this.jsonCacheParsed = parsed; }
+        catch { this.post({ type: 'cellContent', row, col, text: raw }); return; }
+        this.post({ type: 'cellJsonNode', row, col, path: [], offset: 0, node: summarizeNode(parsed, 0) });
+    }
+
+    private handleExpandJsonPath(row: number, col: number, path: JsonPath, offset: number): void {
+        if (this.jsonCacheKey !== `${row},${col}`) return;
+        this.post({ type: 'cellJsonNode', row, col, path, offset, node: summarizeNode(getAtPath(this.jsonCacheParsed, path), offset) });
+    }
+
+    private handleGetJsonScalar(row: number, col: number, path: JsonPath): void {
+        if (this.jsonCacheKey !== `${row},${col}`) return;
+        const value = getAtPath(this.jsonCacheParsed, path);
+        this.post({ type: 'jsonScalar', row, col, path, raw: typeof value === 'string' ? value : JSON.stringify(value), vtype: valueType(value) });
+    }
+
+    private async handleSaveJsonPath(row: number, col: number, path: JsonPath, value: unknown): Promise<void> {
+        if (this.jsonCacheKey !== `${row},${col}`) return;
+        if (path.length === 0) this.jsonCacheParsed = value;
+        else setAtPath(this.jsonCacheParsed, path, value);
+        const newRaw = JSON.stringify(this.jsonCacheParsed);
+        this.rows[row][col] = newRaw;
+        this.truncatedCells.delete(`${row},${col}`);
+        await this.saveFile();
+        this.post({ type: 'cellPreviewUpdated', row, col, preview: newRaw.slice(0, 80) });
+    }
+
+    // ── Message routing ──────────────────────────────────────────────────────────
+
+    private async handleMessage(msg: WebviewMsg): Promise<void> {
+        switch (msg.type) {
             case 'ready':
                 await this.loadFile();
                 break;
-
-            // ── Text cell ──────────────────────────────────────────────────────
-            case 'getCellContent': {
-                const row = msg.row as number, col = msg.col as number;
-                this.post({ type: 'cellContent', row, col, text: await this.getFullCell(row, col) });
+            case 'getCellContent':
+                this.post({ type: 'cellContent', row: msg.row, col: msg.col, text: await this.getFullCell(msg.row, msg.col) });
                 break;
-            }
-
-            case 'editCell': {
-                const row = msg.row as number, col = msg.col as number;
-                if (this.rows[row]) { this.rows[row][col] = msg.value as string; await this.saveFile(); }
+            case 'editCell':
+                if (this.rows[msg.row]) { this.rows[msg.row][msg.col] = msg.value; await this.saveFile(); }
                 break;
-            }
-
-            // ── Search ─────────────────────────────────────────────────────────
-            case 'search': {
-                const seq = ++this.searchSeq;
-                const query = (msg.query as string).trim();
-                if (!query) {
-                    this.searchResultIndices = null;
-                    this.post({ type: 'load', headers: this.headers, rows: makeWebviewRows(this.rows, 0, PAGE_SIZE), totalRows: this.rows.length, hasMore: this.rows.length > PAGE_SIZE, pageSize: PAGE_SIZE });
-                    break;
-                }
-                let expr;
-                try { expr = parseQuery(query); }
-                catch (e) { this.post({ type: 'searchError', message: (e as Error).message }); break; }
-
-                const matched: number[] = [];
-                let ny = 10_000;
-                for (let i = 0; i < this.rows.length; i++) {
-                    if (i >= ny) { ny = i + 10_000; await new Promise<void>(resolve => setImmediate(resolve)); }
-                    if (seq !== this.searchSeq) return;
-                    if (evalExpr(expr, this.rows[i], this.headers)) matched.push(i);
-                }
-                this.searchResultIndices = matched;
-                this.post({
-                    type: 'searchResults',
-                    totalMatches: matched.length,
-                    rows: matched.slice(0, PAGE_SIZE).map(i => makeWebviewCells(this.rows[i])),
-                    originalIndices: matched.slice(0, PAGE_SIZE),
-                    hasMore: matched.length > PAGE_SIZE,
-                    pageStart: 0,
-                });
+            case 'search':
+                await this.handleSearch(msg.query);
                 break;
-            }
-
-            case 'requestSearchPage': {
-                if (!this.searchResultIndices) break;
-                const start = (msg.start as number) ?? 0;
-                const pageIdx = this.searchResultIndices.slice(start, start + PAGE_SIZE);
-                this.post({
-                    type: 'searchResults',
-                    totalMatches: this.searchResultIndices.length,
-                    rows: pageIdx.map(i => makeWebviewCells(this.rows[i])),
-                    originalIndices: pageIdx,
-                    hasMore: start + PAGE_SIZE < this.searchResultIndices.length,
-                    pageStart: start,
-                });
+            case 'requestSearchPage':
+                this.handleRequestSearchPage(msg.start);
                 break;
-            }
-
             case 'clearSearch':
-                this.searchResultIndices = null;
-                this.post({ type: 'load', headers: this.headers, rows: makeWebviewRows(this.rows, 0, PAGE_SIZE), totalRows: this.rows.length, hasMore: this.rows.length > PAGE_SIZE, pageSize: PAGE_SIZE });
+                this.handleClearSearch();
                 break;
-
-            // ── Pagination ─────────────────────────────────────────────────────
-            case 'requestPage': {
-                const start = (msg.start as number) ?? 0;
-                this.post({ type: 'appendRows', rows: makeWebviewRows(this.rows, start, PAGE_SIZE), start, hasMore: start + PAGE_SIZE < this.rows.length });
+            case 'requestPage':
+                this.post({ type: 'appendRows', rows: makeWebviewRows(this.rows, msg.start, PAGE_SIZE), hasMore: msg.start + PAGE_SIZE < this.rows.length });
                 break;
-            }
-
-            // ── JSON tree ──────────────────────────────────────────────────────
-            case 'getCellJson': {
-                const row = msg.row as number, col = msg.col as number;
-                const cacheKey = `${row},${col}`;
-                if (this.jsonCacheKey === cacheKey) {
-                    this.post({ type: 'cellJsonNode', row, col, path: [], offset: 0, node: summarizeNode(this.jsonCacheParsed, 0) });
-                    break;
-                }
-                const raw = await this.getFullCell(row, col);
-                let parsed: unknown;
-                try { parsed = JSON.parse(raw); this.jsonCacheKey = cacheKey; this.jsonCacheParsed = parsed; }
-                catch { this.post({ type: 'cellContent', row, col, text: raw }); break; }
-                this.post({ type: 'cellJsonNode', row, col, path: [], offset: 0, node: summarizeNode(parsed, 0) });
+            case 'getCellJson':
+                await this.handleGetCellJson(msg.row, msg.col);
                 break;
-            }
-
-            case 'expandJsonPath': {
-                const row = msg.row as number, col = msg.col as number;
-                if (this.jsonCacheKey !== `${row},${col}`) break;
-                const path = (msg.path as (string | number)[]) ?? [];
-                const offset = (msg.offset as number) ?? 0;
-                this.post({ type: 'cellJsonNode', row, col, path, offset, node: summarizeNode(getAtPath(this.jsonCacheParsed, path), offset) });
+            case 'expandJsonPath':
+                this.handleExpandJsonPath(msg.row, msg.col, msg.path, msg.offset ?? 0);
                 break;
-            }
-
-            case 'getJsonScalar': {
-                const row = msg.row as number, col = msg.col as number;
-                if (this.jsonCacheKey !== `${row},${col}`) break;
-                const path = (msg.path as (string | number)[]) ?? [];
-                const value = getAtPath(this.jsonCacheParsed, path);
-                this.post({ type: 'jsonScalar', row, col, path, raw: typeof value === 'string' ? value : JSON.stringify(value), vtype: valueType(value) });
+            case 'getJsonScalar':
+                this.handleGetJsonScalar(msg.row, msg.col, msg.path);
                 break;
-            }
-
-            case 'saveJsonPath': {
-                const row = msg.row as number, col = msg.col as number;
-                if (this.jsonCacheKey !== `${row},${col}`) break;
-                const path = msg.path as (string | number)[];
-                if (path.length === 0) this.jsonCacheParsed = msg.value;
-                else setAtPath(this.jsonCacheParsed, path, msg.value);
-                const newRaw = JSON.stringify(this.jsonCacheParsed);
-                this.rows[row][col] = newRaw;
-                this.truncatedCells.delete(`${row},${col}`);
-                await this.saveFile();
-                this.post({ type: 'cellPreviewUpdated', row, col, preview: newRaw.slice(0, 80) });
+            case 'saveJsonPath':
+                await this.handleSaveJsonPath(msg.row, msg.col, msg.path, msg.value);
                 break;
-            }
-
             case 'save':
                 await this.saveFile();
                 break;
